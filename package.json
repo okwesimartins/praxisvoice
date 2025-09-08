@@ -1,0 +1,22 @@
+{
+  "name": "veritas",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@google-cloud/firestore": "^7.11.3",
+    "@google/generative-ai": "^0.15.0",
+    "@slack/bolt": "^4.4.0",
+    "googleapis": "^140.0.1",
+    "cors": "^2.8.5",
+    "dotenv": "^17.2.0",
+    "node-fetch": "^3.3.0",
+    "uuid": "^11.1.0"
+  }
+}
