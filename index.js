@@ -1,14 +1,12 @@
 // index.js — Praxis bot (Slack + API) using new Pluralcode curriculum API (with sandbox)
 // --------------------------------------------------------------------------------------
-// Highlights:
-// - Parses new API: enrolled_courses[].coursename + course_topics[].sub_topic[].name + sandbox[]
-// - Builds "allowedPhrases" to steer explanations & searches (fixes ML scope false negatives)
-// - **Negation-aware** intent parsing (e.g., "don't send videos") + persistent preferences
-// - "Test me on X" works (quiz synonyms); "don't give me videos" respected in both API & Slack
-// - Fix: matchAll() only used with global regex (prevents runtime error)
-// - Strong memory via lastSearchQuery + lastTopic; robust follow-ups for videos/articles/faq/quiz
-// - Quiz answers are TEXT (no letters), options have no A/B/C/D labels
-// - KB-aware articles; per-question articles; URL validation; event locks; Firestore history
+// Highlights (delta):
+// - Robust payload harvesting (topics/subtopics regardless of exact keys)
+// - Agile/Scrum synonyms (scrum events/ceremonies + sprint planning/daily/review/retro/refinement)
+// - Fuzzy topic matching (token-overlap) to avoid false “out-of-scope”
+// - Safer query builder: never falls back to raw user text out-of-scope
+// - Meta-queries: “what course am I enrolled in?”
+// - Friendly Slack error when Slack email isn’t enrolled
 
 if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
@@ -129,6 +127,8 @@ const cleanAndValidateResults = async (items, max = 3) => {
 
 // Normalizers
 const normalizeEmail = (e) => String(e || '').trim().toLowerCase();
+const norm = (s = '') =>
+  String(s || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
 
 // -----------------------------------------------------------------------------
 // Search tools
@@ -325,12 +325,15 @@ const acquireEventLock = async (eventId) => {
 // -----------------------------------------------------------------------------
 const PLURALCODE_API_BASE = process.env.PLURALCODE_API_URL || 'https://backend.pluralcode.institute';
 
+// Synonyms
 const addSynonyms = (phrase, bag) => {
   const raw = String(phrase || '');
   const display = raw.trim();
   const p = display.toLowerCase();
   if (!display) return bag;
   bag.add(display); // keep original phrase
+
+  // Common tech synonyms
   if (/javascript/.test(p)) { bag.add('javascript'); bag.add('js'); }
   if (/power\s*bi|powerbi|pbi/.test(p)) { bag.add('power bi'); bag.add('pbi'); bag.add('powerbi'); }
   if (/vlookup/.test(p)) { bag.add('vlookup'); }
@@ -344,8 +347,52 @@ const addSynonyms = (phrase, bag) => {
   if (/data\s*analytics?/.test(p)) { bag.add('data analytics'); }
   if (/web\s*scraping/.test(p)) { bag.add('web scraping'); }
   if (/dax/.test(p)) { bag.add('dax'); }
+
+  // Agile/Scrum domain
+  if (/\bscrum\b/.test(p) || /\bagile\b/.test(p)) {
+    bag.add('scrum'); bag.add('agile');
+    bag.add('scrum events'); bag.add('scrum ceremonies'); bag.add('agile ceremonies');
+    bag.add('sprint planning'); bag.add('daily scrum'); bag.add('daily standup');
+    bag.add('sprint review'); bag.add('sprint retrospective');
+    bag.add('backlog refinement'); bag.add('product backlog refinement');
+  }
+  if (/kanban/.test(p)) { bag.add('kanban'); }
+
   return bag;
 };
+
+// Payload harvester (tolerant to shape)
+const TOPIC_STRING_KEYS = new Set([
+  'coursename','course','course_name','name','title','topic','topic_name','label',
+  'module','module_name','lesson','lesson_name','chapter','section','unit'
+]);
+const TOPIC_ARRAY_KEYS = new Set([
+  'course_topics','topics','sub_topic','sub_topics','children','modules','lessons','chapters','sections','units','items'
+]);
+
+function harvestCourseStrings(node, bag) {
+  if (!node) return;
+  if (Array.isArray(node)) {
+    for (const it of node) harvestCourseStrings(it, bag);
+    return;
+  }
+  if (typeof node === 'object') {
+    for (const [k, v] of Object.entries(node)) {
+      const key = String(k).toLowerCase();
+      if (typeof v === 'string') {
+        if (TOPIC_STRING_KEYS.has(key)) {
+          const s = v.trim();
+          if (s && !/^https?:\/\//i.test(s) && s.length <= 200) addSynonyms(s, bag);
+        }
+      } else if (Array.isArray(v)) {
+        // Traverse arrays whether or not the key matches the shortlist (defensive)
+        for (const child of v) harvestCourseStrings(child, bag);
+      } else if (typeof v === 'object' && v) {
+        harvestCourseStrings(v, bag);
+      }
+    }
+  }
+}
 
 const buildAllowedFromPayload = (data) => {
   const phrases = new Set();
@@ -354,32 +401,22 @@ const buildAllowedFromPayload = (data) => {
   try {
     const enrolled = Array.isArray(data.enrolled_courses) ? data.enrolled_courses : [];
     for (const c of enrolled) {
-      if (c?.coursename) {
-        courseNames.push(c.coursename);
-        addSynonyms(c.coursename, phrases);
+      const courseName = (c.coursename || c.course_name || c.name || c.title || '').trim();
+      if (courseName) {
+        courseNames.push(courseName);
+        addSynonyms(courseName, phrases);
       }
-      const topics = Array.isArray(c?.course_topics) ? c.course_topics : [];
-      for (const t of topics) {
-        if (t?.topic) addSynonyms(t.topic, phrases);
-        const subs = Array.isArray(t?.sub_topic) ? t.sub_topic : [];
-        for (const s of subs) {
-          if (s?.name) addSynonyms(s.name, phrases);
-        }
-      }
+      // Harvest topics/subtopics robustly
+      if (c.course_topics) harvestCourseStrings(c.course_topics, phrases);
+      else harvestCourseStrings(c, phrases);
     }
     const sandbox = Array.isArray(data.sandbox) ? data.sandbox : [];
-    for (const s of sandbox) {
-      if (s?.topic) addSynonyms(s.topic, phrases);
-      const subs = Array.isArray(s?.sub_topic) ? s.sub_topic : [];
-      for (const st of subs) {
-        if (st?.name) addSynonyms(st.name, phrases);
-      }
-    }
+    for (const s of sandbox) harvestCourseStrings(s, phrases);
   } catch (_) { /* ignore */ }
 
   return {
     courseNames,
-    allowedPhrases: Array.from(phrases) // keep original casing for display + lowercased synonyms already added
+    allowedPhrases: Array.from(phrases)
   };
 };
 
@@ -393,7 +430,10 @@ const getStudentScope = async (email) => {
     const data = await response.json();
     const scope = buildAllowedFromPayload(data);
     if (!scope.courseNames.length) throw new Error('No active course enrollment found.');
-    return scope; // { courseNames: [...], allowedPhrases: [...] }
+    if (process.env.DEBUG_SCOPE === '1') {
+      console.debug('Parsed scope', { email: clean, courses: scope.courseNames, phrasesCount: scope.allowedPhrases.length, sample: scope.allowedPhrases.slice(0, 30) });
+    }
+    return scope;
   } catch (error) {
     throw new Error("Could not verify student enrollment.");
   }
@@ -419,6 +459,14 @@ const normalizeQuery = (q = '') => {
   t = t.replace(/\s+/g, ' ').trim();
   const words = t.split(' ').slice(0, 12);
   return words.join(' ').trim();
+};
+
+// Meta: asking what course they’re enrolled in
+const isEnrollmentMetaQuery = (msg = '') => {
+  const m = norm(msg);
+  return /\b(what|which)\b.*\b(course|program|track)s?\b.*\b(enroll|enrolled|registered|taking)\b/.test(m)
+      || /\b(am i|my)\b.*\b(enrolled|course|program|track)\b/.test(m)
+      || /\b(which course am i (in|enrolled in))\b/.test(m);
 };
 
 // Negation helpers ------------------------------------------------------------
@@ -505,6 +553,23 @@ const bestPhraseMatch = (msg = '', phrases = []) => {
   return best ? best.original : null;
 };
 
+// NEW: fuzzy token-overlap
+function bestFuzzyMatch(msg = '', phrases = []) {
+  if (!msg || !phrases?.length) return null;
+  const toks = new Set(String(msg).toLowerCase().match(/\b[a-z0-9]+\b/g) || []);
+  let best = null;
+
+  for (const ph of phrases) {
+    const ptoks = new Set(String(ph).toLowerCase().match(/\b[a-z0-9]+\b/g) || []);
+    const inter = [...ptoks].filter(t => toks.has(t));
+    const score = inter.length / Math.max(1, ptoks.size);
+    const hasStrong = inter.some(t => ['scrum','agile','kanban','sprint','review','retrospective','backlog','ceremonies','events'].includes(t));
+    const weighted = score + (hasStrong ? 0.5 : 0);
+    if (!best || weighted > best.score) best = { phrase: ph, score: weighted };
+  }
+  return best && best.score >= 0.35 ? best.phrase : null;
+}
+
 const synthesizeSearchQueryWithLLM = async (history, fallback = '') => {
   try {
     const chat = startChat(history, { generationConfig: { responseMimeType: 'application/json' } });
@@ -524,7 +589,7 @@ const buildSearchQuery = async ({ sessionId, userMessage, defaultTopic, allowedP
   const explicit = extractExplicitTopic(userMessage);
   if (explicit) return normalizeQuery(explicit);
 
-  const best = bestPhraseMatch(userMessage, allowedPhrases || []);
+  const best = bestPhraseMatch(userMessage, allowedPhrases || []) || bestFuzzyMatch(userMessage, allowedPhrases || []);
   if (best) return normalizeQuery(best);
 
   const state = await getConvState(sessionId);
@@ -534,10 +599,9 @@ const buildSearchQuery = async ({ sessionId, userMessage, defaultTopic, allowedP
     const n = normalizeQuery(defaultTopic);
     if (n) return n;
   }
-
   const history = await getConversationHistory(sessionId);
-  // >>> CHANGE: never fall back to raw user text; stay strictly in-scope
-  const synthesized = await synthesizeSearchQueryWithLLM(history, ''); // no raw fallback
+  // Never fall back to raw user text; keep in-scope
+  const synthesized = await synthesizeSearchQueryWithLLM(history, '');
   const safe = (allowedPhrases && allowedPhrases[0]) || defaultTopic || '';
   return normalizeQuery(synthesized || safe);
 };
@@ -556,7 +620,7 @@ Student Email: ${studentEmail}
 Enrolled Course(s): "${enrolledCourseNames}"
 [ALLOWED TOPICS SAMPLE] (truncated): ${sample}
 [RESOLVED TOPIC]: ${resolvedTopic}
-[POLICY] Answer ONLY if the topic is within the student's curriculum/sandbox. If out of scope, briefly say it's outside their program and offer 2–3 in-scope alternatives.`; // >>> CHANGE
+[POLICY] Answer ONLY if the topic is within the student's curriculum/sandbox. If out of scope, briefly say it's outside their program and offer 2–3 in-scope alternatives. Avoid placeholders; use concrete details from the curriculum.`;
 };
 
 const resolveIntentAndTopic = async ({ sessionId, userMessage, allowedPhrases }) => {
@@ -568,6 +632,7 @@ const resolveIntentAndTopic = async ({ sessionId, userMessage, allowedPhrases })
 
   let topic = extractExplicitTopic(userMessage);
   if (!topic) topic = bestPhraseMatch(userMessage, allowedPhrases || []);
+  if (!topic) topic = bestFuzzyMatch(userMessage, allowedPhrases || []); // fuzzy rescue
   if (!topic) topic = state.lastTopic; // follow-up fallback
 
   // If user has a preferredFormat (e.g., set by "text only" earlier), use it when no explicit format now
@@ -630,6 +695,13 @@ async function processUserRequest({ sessionId, userMessage, studentEmail, suppor
 
   // Persist allowed phrases in conv-state so future turns (even if API fetch fails) still have scope
   await updateConvState(sessionId, { allowedPhrases, lastCourse: enrolledCourseNames });
+
+  // Meta: “what course am I enrolled in?”
+  if (isEnrollmentMetaQuery(userMessage)) {
+    const courseList = studentScope.courseNames.length ? `You’re enrolled in: **${studentScope.courseNames.join(', ')}**.` : `I couldn’t find active enrollments.`;
+    if (responseMode === 'api') return { json: { data: { content: courseList } } };
+    return { text: courseList };
+  }
 
   // Parse JSON array input: [{"course_topic":"...", "format":"..."}]
   let parsedInput = null;
@@ -766,8 +838,8 @@ Return EXACTLY:
 ${userMessage}
 
 [INSTRUCTIONS]
-Write a friendly, accurate explanation strictly within the allowed curriculum. Use 3–6 concrete bullets (from the course content), then end with ONE short check-for-understanding question. 
-Do NOT use placeholders like "Key idea #1". If the topic is out of scope, say so briefly and suggest 2–3 in-scope alternatives.`; // >>> CHANGE
+Write a friendly, accurate explanation strictly within the allowed curriculum. Use 3–6 concrete bullets (from the course content), then end with ONE short check-for-understanding question.
+Do NOT use placeholders like "Key idea #1". If the topic is out of scope, say so briefly and suggest 2–3 in-scope alternatives.`;
     const explanation = await runWithToolsIfNeeded(chat, prompt);
 
     let materials = {};
@@ -788,7 +860,7 @@ Do NOT use placeholders like "Key idea #1". If the topic is out of scope, say so
   // ---- API: plain text smart when no support_format and not JSON -------------
   if (responseMode === 'api' && !supportFormat && !parsedInput) {
     const requestedFormat = resolvedFormat || state.preferredFormat || 'text';
-    const topicBase = resolvedTopic || state.lastTopic || (allowedPhrases && allowedPhrases[0]) || 'Getting started'; // >>> CHANGE
+    const topicBase = resolvedTopic || state.lastTopic || (allowedPhrases && allowedPhrases[0]) || 'Getting started';
     const query = await buildSearchQuery({ sessionId, userMessage, defaultTopic: topicBase, allowedPhrases });
     await updateConvState(sessionId, { lastTopic: topicBase, lastFormat: requestedFormat, lastCourse: enrolledCourseNames, lastSearchQuery: query });
 
@@ -888,7 +960,7 @@ Return EXACTLY:
 ${userMessage}
 
 [INSTRUCTIONS]
-Explain clearly and concisely strictly within the enrolled curriculum. Use concrete bullets taken from the course content (no placeholders), and finish with ONE short question to check understanding. If the request is out of scope, say so briefly and suggest 2–3 in-scope alternatives.`; // >>> CHANGE
+Explain clearly and concisely strictly within the enrolled curriculum. Use concrete bullets taken from the course content (no placeholders), and finish with ONE short question to check understanding. If the request is out of scope, say so briefly and suggest 2–3 in-scope alternatives.`;
     const explanation = await runWithToolsIfNeeded(chat, prompt);
     const payload = { data: { content: explanation } };
     await saveToHistory(sessionId, `API(text): ${topicBase}`, JSON.stringify(payload), { lastSearchQuery: await buildSearchQuery({ sessionId, userMessage, defaultTopic: topicBase, allowedPhrases }) });
@@ -896,8 +968,8 @@ Explain clearly and concisely strictly within the enrolled curriculum. Use concr
   }
 
   // ----------------------------- Slack mode -----------------------------------
-  const requestedFormat = resolvedFormat || null; // do not force 'text' here; detection or default path handles it
-  const topicForSlack = resolvedTopic || state.lastTopic || (allowedPhrases && allowedPhrases[0]) || 'Getting started'; // >>> CHANGE
+  const requestedFormat = resolvedFormat || null;
+  const topicForSlack = resolvedTopic || state.lastTopic || (allowedPhrases && allowedPhrases[0]) || 'Getting started';
   const query = await buildSearchQuery({ sessionId, userMessage, defaultTopic: topicForSlack, allowedPhrases });
 
   await updateConvState(sessionId, { lastTopic: topicForSlack, lastFormat: requestedFormat || state.preferredFormat || 'text', lastCourse: enrolledCourseNames, lastSearchQuery: query });
@@ -944,7 +1016,6 @@ Return EXACTLY:
     const text = await runWithToolsIfNeeded(chat, prompt);
     let payload = { data: { faqs: [] } };
     try { payload = JSON.parse(text); } catch {}
-    // Render markdown for Slack
     const faqs = Array.isArray(payload?.data?.faqs) ? payload.data.faqs : [];
     const md = faqs.length
       ? faqs.map((f, i) => `**Q${i+1}. ${f.question}**\n${f.answer}`).join('\n\n')
@@ -1019,7 +1090,7 @@ Return EXACTLY:
 ${userMessage}
 
 [SLACK OUTPUT]
-Reply in Markdown. Provide a concise, accurate explanation drawn from the curriculum (no placeholders), then end with ONE short question to confirm understanding. If the request is out of scope, say so briefly and suggest 2–3 in-scope alternatives.`; // >>> CHANGE
+Reply in Markdown. Provide a concise, accurate explanation drawn from the curriculum (no placeholders), then end with ONE short question to confirm understanding. If the request is out of scope, say so briefly and suggest 2–3 in-scope alternatives.`;
   const slackText = await runWithToolsIfNeeded(chat, prompt);
   await saveToHistory(sessionId, userMessage, slackText, { lastSearchQuery: query });
   return { text: slackText };
@@ -1089,7 +1160,6 @@ async function handleSlackEvent({ event, client, say }) {
     const sessionId = `${event.channel}_${event.thread_ts || event.ts}`;
     const userMessage = (event.text || '').replace(/<@.*?>/g, '').trim();
 
-    // Let intent detection decide; don't force any quick format here
     const { text } = await processUserRequest({
       sessionId,
       userMessage,
@@ -1101,7 +1171,7 @@ async function handleSlackEvent({ event, client, say }) {
     await say({ text, thread_ts: event.thread_ts || event.ts });
 
   } catch (error) {
-    // >>> CHANGE: friendlier message when Slack email isn’t enrolled
+    // Friendly message when Slack email isn’t enrolled
     const msg = String(error.message || '').includes('Could not verify student enrollment.')
       ? "Sorry, an error occurred: we can’t identify you as a student, kindly ensure you are signed into Slack with the same email address you used for your admission."
       : `Sorry, an error occurred: ${error.message}`;
