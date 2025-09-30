@@ -1,13 +1,6 @@
 // index.js — Praxis bot (Slack + API) using new Pluralcode curriculum API (with sandbox)
+// Text-only Slack quiz (no Block Kit) to avoid invalid_blocks
 // --------------------------------------------------------------------------------------
-// Highlights (delta):
-// - Robust payload harvesting (topics/subtopics regardless of exact keys)
-// - Agile/Scrum synonyms (scrum events/ceremonies + sprint planning/daily/review/retro/refinement)
-// - Fuzzy topic matching (token-overlap) to avoid false “out-of-scope”
-// - Safer query builder: never falls back to raw user text out-of-scope
-// - Meta-queries: “what course am I enrolled in?”
-// - Friendly Slack error when Slack email isn’t enrolled
-
 if (process.env.NODE_ENV !== 'production') {
   require('dotenv').config();
 }
@@ -44,6 +37,7 @@ const app = new App({
 const db = new Firestore();
 const CONVERSATIONS_COLLECTION = 'conversations';
 const EVENT_LOCKS_COLLECTION = 'eventLocks';
+const QUIZ_SESSIONS_COLLECTION = 'quizSessions';
 const HISTORY_LIMIT = 40;
 
 // --- External APIs ---
@@ -99,7 +93,6 @@ const isLikelyGoodUrl = (url) => {
 };
 
 const validateUrl = async (url) => {
-  // Always allow KB links (may 302 or block HEAD)
   if (url.includes('pluralcode.academy') || url.includes('drive.google.com')) return true;
   if (!isLikelyGoodUrl(url)) return false;
   try {
@@ -183,7 +176,7 @@ const availableTools = { search_youtube_for_videos, search_web_for_articles };
 // -----------------------------------------------------------------------------
 // Gemini Setup
 // -----------------------------------------------------------------------------
-const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY,{ apiVersion: 'v1' });
 
 const safetySettings = [
   { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
@@ -251,14 +244,20 @@ Do NOT invent links. Use KB links for Pluralcode questions when applicable.
 `;
 
 // Utility to start a chat
-const startChat = (history, opts = {}) =>
-  genAI.getGenerativeModel({
-    model: "gemini-1.5-pro",
-    safetySettings,
-    tools: toolDefs,
-    systemInstruction: BASE_SYSTEM_INSTRUCTION,
-    generationConfig: opts.generationConfig || undefined,
-  }).startChat({ history });
+const startChat = (history, opts = {}) => {
+ const wantsJson = opts?.generationConfig?.responseMimeType === 'application/json';
+  const modelConfig = {
+  model: "gemini-2.5-pro",
+ safetySettings,
+ systemInstruction: BASE_SYSTEM_INSTRUCTION,
+generationConfig: opts.generationConfig || undefined,
+  };
+
+ if (!wantsJson) {
+   modelConfig.tools = toolDefs;
+ }
+return genAI.getGenerativeModel(modelConfig).startChat({ history });
+}
 
 // -----------------------------------------------------------------------------
 // History + State
@@ -325,43 +324,40 @@ const acquireEventLock = async (eventId) => {
 // -----------------------------------------------------------------------------
 const PLURALCODE_API_BASE = process.env.PLURALCODE_API_URL || 'https://backend.pluralcode.institute';
 
-// Synonyms
+// Synonyms (expanded to cover NumPy/Pandas etc.)
 const addSynonyms = (phrase, bag) => {
   const raw = String(phrase || '');
   const display = raw.trim();
   const p = display.toLowerCase();
   if (!display) return bag;
-  bag.add(display); // keep original phrase
+  bag.add(display); // keep original
 
-  // Common tech synonyms
+  // General
   if (/javascript/.test(p)) { bag.add('javascript'); bag.add('js'); }
-  if (/power\s*bi|powerbi|pbi/.test(p)) { bag.add('power bi'); bag.add('pbi'); bag.add('powerbi'); }
-  if (/vlookup/.test(p)) { bag.add('vlookup'); }
-  if (/hlookup/.test(p)) { bag.add('hlookup'); }
+
+  // Data / Python ecosystem
+  if (/python/.test(p) || /data\s*analytics?/.test(p)) {
+    ['python','numpy','pandas','matplotlib','seaborn','scikit-learn','jupyter','anaconda','etl','data wrangling']
+      .forEach(x => bag.add(x));
+  }
   if (/\bsql\b/.test(p)) { bag.add('sql'); }
   if (/excel/.test(p)) { bag.add('excel'); }
-  if (/python/.test(p)) { bag.add('python'); }
+  if (/power\s*bi|powerbi|pbi/.test(p)) { bag.add('power bi'); bag.add('pbi'); bag.add('powerbi'); }
   if (/machine\s*learning/.test(p)) { bag.add('ml'); bag.add('machine learning'); }
-  if (/\bux\b|user\s*experience/.test(p)) { bag.add('ux'); bag.add('user experience'); }
-  if (/\bui\b|user\s*interface/.test(p)) { bag.add('ui'); bag.add('user interface'); }
-  if (/data\s*analytics?/.test(p)) { bag.add('data analytics'); }
   if (/web\s*scraping/.test(p)) { bag.add('web scraping'); }
   if (/dax/.test(p)) { bag.add('dax'); }
 
-  // Agile/Scrum domain
-  if (/\bscrum\b/.test(p) || /\bagile\b/.test(p)) {
-    bag.add('scrum'); bag.add('agile');
-    bag.add('scrum events'); bag.add('scrum ceremonies'); bag.add('agile ceremonies');
-    bag.add('sprint planning'); bag.add('daily scrum'); bag.add('daily standup');
-    bag.add('sprint review'); bag.add('sprint retrospective');
-    bag.add('backlog refinement'); bag.add('product backlog refinement');
+  // Agile/Scrum
+  if (/\bscrum\b|agile/.test(p)) {
+    'scrum,agile,scrum events,scrum ceremonies,agile ceremonies,sprint planning,daily scrum,daily standup,sprint review,sprint retrospective,backlog refinement,product backlog refinement'
+      .split(',').forEach(x => bag.add(x));
   }
   if (/kanban/.test(p)) { bag.add('kanban'); }
 
   return bag;
 };
 
-// Payload harvester (tolerant to shape)
+// Harvest topics from payload (robust)
 const TOPIC_STRING_KEYS = new Set([
   'coursename','course','course_name','name','title','topic','topic_name','label',
   'module','module_name','lesson','lesson_name','chapter','section','unit'
@@ -385,7 +381,6 @@ function harvestCourseStrings(node, bag) {
           if (s && !/^https?:\/\//i.test(s) && s.length <= 200) addSynonyms(s, bag);
         }
       } else if (Array.isArray(v)) {
-        // Traverse arrays whether or not the key matches the shortlist (defensive)
         for (const child of v) harvestCourseStrings(child, bag);
       } else if (typeof v === 'object' && v) {
         harvestCourseStrings(v, bag);
@@ -402,22 +397,15 @@ const buildAllowedFromPayload = (data) => {
     const enrolled = Array.isArray(data.enrolled_courses) ? data.enrolled_courses : [];
     for (const c of enrolled) {
       const courseName = (c.coursename || c.course_name || c.name || c.title || '').trim();
-      if (courseName) {
-        courseNames.push(courseName);
-        addSynonyms(courseName, phrases);
-      }
-      // Harvest topics/subtopics robustly
+      if (courseName) { courseNames.push(courseName); addSynonyms(courseName, phrases); }
       if (c.course_topics) harvestCourseStrings(c.course_topics, phrases);
       else harvestCourseStrings(c, phrases);
     }
     const sandbox = Array.isArray(data.sandbox) ? data.sandbox : [];
     for (const s of sandbox) harvestCourseStrings(s, phrases);
-  } catch (_) { /* ignore */ }
+  } catch (_) {}
 
-  return {
-    courseNames,
-    allowedPhrases: Array.from(phrases)
-  };
+  return { courseNames, allowedPhrases: Array.from(phrases) };
 };
 
 const getStudentScope = async (email) => {
@@ -430,9 +418,6 @@ const getStudentScope = async (email) => {
     const data = await response.json();
     const scope = buildAllowedFromPayload(data);
     if (!scope.courseNames.length) throw new Error('No active course enrollment found.');
-    if (process.env.DEBUG_SCOPE === '1') {
-      console.debug('Parsed scope', { email: clean, courses: scope.courseNames, phrasesCount: scope.allowedPhrases.length, sample: scope.allowedPhrases.slice(0, 30) });
-    }
     return scope;
   } catch (error) {
     throw new Error("Could not verify student enrollment.");
@@ -461,7 +446,6 @@ const normalizeQuery = (q = '') => {
   return words.join(' ').trim();
 };
 
-// Meta: asking what course they’re enrolled in
 const isEnrollmentMetaQuery = (msg = '') => {
   const m = norm(msg);
   return /\b(what|which)\b.*\b(course|program|track)s?\b.*\b(enroll|enrolled|registered|taking)\b/.test(m)
@@ -469,16 +453,9 @@ const isEnrollmentMetaQuery = (msg = '') => {
       || /\b(which course am i (in|enrolled in))\b/.test(m);
 };
 
-// Negation helpers ------------------------------------------------------------
+// Negation helpers
 const NEG_WORDS = ['don\'t', 'dont', 'do not', 'no', 'without', 'except', 'stop', 'never', 'no more', 'anymore', 'not'];
-
-// Ensure regex is global for matchAll()
-const toGlobal = (re) => {
-  if (!re) return re;
-  const flags = re.flags && re.flags.includes('g') ? re.flags : (re.flags || '') + 'g';
-  return new RegExp(re.source, flags);
-};
-
+const toGlobal = (re) => !re ? re : new RegExp(re.source, re.flags && re.flags.includes('g') ? re.flags : (re.flags || '') + 'g');
 const hasNegationNear = (lower, reTerm) => {
   const re = toGlobal(reTerm);
   const matches = [...lower.matchAll(re)];
@@ -491,7 +468,6 @@ const hasNegationNear = (lower, reTerm) => {
   return false;
 };
 
-// Detect intent (format) with negation + persistence
 const detectFormatFromMessage = (lower, state) => {
   const videoRe   = /\bvideo(s)?\b|\byoutube\b/gi;
   const articleRe = /\barticle(s)?\b|\bmaterial(s)?\b|\bdoc(s|umentation)?\b|\bguide\b|\bblog\b/gi;
@@ -511,7 +487,6 @@ const detectFormatFromMessage = (lower, state) => {
     text: textRe.test(lower) || /\bjust\s*(teach|explain)\b/.test(lower) || /\btext only\b/.test(lower),
   };
 
-  // precedence: quiz > faq > video > article > text
   let format = null;
   if (wants.quiz) format = 'quiz';
   else if (wants.faq) format = 'faq';
@@ -522,7 +497,6 @@ const detectFormatFromMessage = (lower, state) => {
   return { format, avoids };
 };
 
-// Persist preferences (e.g., "no more videos")
 const updateFormatPrefsFromMessage = async (sessionId, lower) => {
   const state = await getConvState(sessionId);
   let block = new Set(state.formatBlocklist || []);
@@ -553,17 +527,15 @@ const bestPhraseMatch = (msg = '', phrases = []) => {
   return best ? best.original : null;
 };
 
-// NEW: fuzzy token-overlap
 function bestFuzzyMatch(msg = '', phrases = []) {
   if (!msg || !phrases?.length) return null;
   const toks = new Set(String(msg).toLowerCase().match(/\b[a-z0-9]+\b/g) || []);
   let best = null;
-
   for (const ph of phrases) {
     const ptoks = new Set(String(ph).toLowerCase().match(/\b[a-z0-9]+\b/g) || []);
     const inter = [...ptoks].filter(t => toks.has(t));
     const score = inter.length / Math.max(1, ptoks.size);
-    const hasStrong = inter.some(t => ['scrum','agile','kanban','sprint','review','retrospective','backlog','ceremonies','events'].includes(t));
+    const hasStrong = inter.some(t => ['scrum','agile','kanban','sprint','review','retrospective','backlog','ceremonies','events','numpy','pandas','python','sql','excel'].includes(t));
     const weighted = score + (hasStrong ? 0.5 : 0);
     if (!best || weighted > best.score) best = { phrase: ph, score: weighted };
   }
@@ -581,7 +553,7 @@ Return strict JSON: {"query":"..."}`);
     if (parsed && typeof parsed.query === 'string' && parsed.query.trim().length) {
       return parsed.query.trim();
     }
-  } catch (_) { /* ignore */ }
+  } catch (_) {}
   return fallback || '';
 };
 
@@ -600,13 +572,11 @@ const buildSearchQuery = async ({ sessionId, userMessage, defaultTopic, allowedP
     if (n) return n;
   }
   const history = await getConversationHistory(sessionId);
-  // Never fall back to raw user text; keep in-scope
   const synthesized = await synthesizeSearchQueryWithLLM(history, '');
   const safe = (allowedPhrases && allowedPhrases[0]) || defaultTopic || '';
   return normalizeQuery(synthesized || safe);
 };
 
-// Prompt header helpers to avoid scope false-negatives
 const summarizeAllowed = (arr, n = 80) => {
   if (!Array.isArray(arr) || !arr.length) return '(none)';
   const head = arr.slice(0, n).join(' • ');
@@ -623,34 +593,14 @@ Enrolled Course(s): "${enrolledCourseNames}"
 [POLICY] Answer ONLY if the topic is within the student's curriculum/sandbox. If out of scope, briefly say it's outside their program and offer 2–3 in-scope alternatives. Avoid placeholders; use concrete details from the curriculum.`;
 };
 
-const resolveIntentAndTopic = async ({ sessionId, userMessage, allowedPhrases }) => {
-  const lower = (userMessage || '').toLowerCase();
-
-  // Detect format intent (negation-aware + persistent blocklist)
-  const state = await getConvState(sessionId);
-  const { format: detectedFormat } = detectFormatFromMessage(lower, state);
-
-  let topic = extractExplicitTopic(userMessage);
-  if (!topic) topic = bestPhraseMatch(userMessage, allowedPhrases || []);
-  if (!topic) topic = bestFuzzyMatch(userMessage, allowedPhrases || []); // fuzzy rescue
-  if (!topic) topic = state.lastTopic; // follow-up fallback
-
-  // If user has a preferredFormat (e.g., set by "text only" earlier), use it when no explicit format now
-  let format = detectedFormat || state.preferredFormat || null;
-
-  return { topic, format, state };
-};
-
 // -----------------------------------------------------------------------------
-// Tool-call loop
+// Tool-call loop + quiz sanitizers
 // -----------------------------------------------------------------------------
 const runWithToolsIfNeeded = async (chat, prompt) => {
   let result = await chat.sendMessage(prompt);
-
   for (let i = 0; i < 3; i++) {
     const calls = result?.response?.functionCalls?.() || [];
     if (!calls.length) break;
-
     const toolResponses = await Promise.all(
       calls.map(async (call) => {
         const fn = availableTools[call.name];
@@ -659,21 +609,16 @@ const runWithToolsIfNeeded = async (chat, prompt) => {
         return {
           functionResponse: {
             name: call.name,
-            response: {
-              name: call.name,
-              content: [{ text: JSON.stringify(toolResult) }]
-            }
+            response: { name: call.name, content: [{ text: JSON.stringify(toolResult) }] }
           }
         };
       })
     );
-
     result = await chat.sendMessage(toolResponses.filter(Boolean));
   }
   return result?.response?.text?.() || '';
 };
 
-// Quiz sanitizers
 const stripLabel = (s) => (typeof s === 'string' ? s.replace(/^\s*[A-D]\s*[\.\)]\s*/i, '').trim() : s);
 const letterToIndex = (ch) => {
   const m = String(ch || '').trim().toUpperCase().match(/^[A-D]$/);
@@ -681,29 +626,116 @@ const letterToIndex = (ch) => {
   return m[0].charCodeAt(0) - 'A'.charCodeAt(0);
 };
 
+// ============================================================================
+// TEXT-ONLY Slack Quiz (no Block Kit)
+// ============================================================================
+const makeQuizKey = ({ channel, thread, user }) => `${channel}:${thread || 'root'}:${user}`;
+async function createQuizSession(key, payload) {
+  await db.collection(QUIZ_SESSIONS_COLLECTION).doc(key).set(
+    { ...payload, createdAt: Timestamp.now(), updatedAt: Timestamp.now(), completed: false },
+    { merge: true }
+  );
+}
+async function getQuizSession(key) {
+  const doc = await db.collection(QUIZ_SESSIONS_COLLECTION).doc(key).get();
+  return doc.exists ? doc.data() : null;
+}
+async function updateQuizSession(key, updates) {
+  await db.collection(QUIZ_SESSIONS_COLLECTION).doc(key).set(
+    { ...updates, updatedAt: Timestamp.now() },
+    { merge: true }
+  );
+}
+async function completeQuizSession(key, updates = {}) {
+  await db.collection(QUIZ_SESSIONS_COLLECTION).doc(key).set(
+    { completed: true, ...updates, updatedAt: Timestamp.now() },
+    { merge: true }
+  );
+}
+
+const fmtQuestionText = ({ topic, index, total, q }) => {
+  const opts = Array.isArray(q.options) ? q.options.slice(0, 4) : [];
+  const map = ['A', 'B', 'C', 'D'];
+  const lines = opts.map((o, i) => `${map[i]}. ${o}`);
+  return `*Quiz: ${topic}*\n*Question ${index + 1} of ${total}*\n${q.question_text}\n\n${lines.join('\n')}\n\n_Reply with A, B, C, D, 1-4, or the exact option text._`;
+};
+
+const fmtStepFeedback = ({ correct, correctAns, selected }) =>
+  correct ? `✅ Correct!` : `Not quite. Correct answer: *${correctAns}* (you chose "${selected}").`;
+
+const fmtSummary = ({ topic, score, total, answers }) => {
+  const items = answers.map((a, i) => {
+    const mark = a.correct ? '✅' : '❌';
+    return `${mark} Q${i + 1}: ${a.question}\n• Your answer: ${a.selected}\n• Correct: ${a.correct_answer}`;
+  }).join('\n\n');
+  return `*Quiz complete: ${topic}*\n*Score:* ${score} / ${total}\n\n${items}\n\n_Type "retake quiz" to try again._`;
+};
+
+const parseAnswerIndex = (text, options) => {
+  const s = String(text || '').trim();
+  const upper = s.toUpperCase();
+
+  // Letter A-D
+  const mLetter = upper.match(/^[A-D]$/) || upper.match(/^[A-D][\.\)]$/);
+  if (mLetter) return upper.charCodeAt(0) - 'A'.charCodeAt(0);
+
+  // Number 1-4
+  const mNum = s.match(/^\s*([1-4])\s*$/);
+  if (mNum) return parseInt(mNum[1], 10) - 1;
+
+  // "option 2", "choice 3"
+  const mWordNum = s.match(/\b(option|choice)\s*([1-4])\b/i);
+  if (mWordNum) return parseInt(mWordNum[2], 10) - 1;
+
+  // Exact or fuzzy option text
+  const norm = (x) => String(x || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const n = norm(s);
+  let best = { idx: -1, score: 0 };
+  options.forEach((opt, i) => {
+    const on = norm(opt);
+    if (on === n) best = { idx: i, score: 1 };
+    else {
+      const toks = new Set(n.split(' '));
+      const otoks = new Set(on.split(' '));
+      const inter = [...toks].filter(t => otoks.has(t)).length;
+      const score = inter / Math.max(1, otoks.size);
+      if (score > best.score) best = { idx: i, score };
+    }
+  });
+  return best.score >= 0.5 ? best.idx : -1;
+};
+
 // -----------------------------------------------------------------------------
-// Unified orchestrator
+// Unified orchestrator (Slack + API)
 // -----------------------------------------------------------------------------
+async function resolveIntentAndTopic({ sessionId, userMessage, allowedPhrases }) {
+  const lower = (userMessage || '').toLowerCase();
+  const state = await getConvState(sessionId);
+  const { format: detectedFormat } = detectFormatFromMessage(lower, state);
+
+  let topic = extractExplicitTopic(userMessage);
+  if (!topic) topic = bestPhraseMatch(userMessage, allowedPhrases || []);
+  if (!topic) topic = bestFuzzyMatch(userMessage, allowedPhrases || []);
+  if (!topic) topic = state.lastTopic;
+
+  let format = detectedFormat || state.preferredFormat || null;
+  return { topic, format, state };
+}
+
 async function processUserRequest({ sessionId, userMessage, studentEmail, supportFormat = null, responseMode = 'slack' }) {
-  // Update prefs first (so a message like "don't send videos anymore" is memorized)
   await updateFormatPrefsFromMessage(sessionId, String(userMessage || '').toLowerCase());
 
-  // Get enriched student scope
   const studentScope = await getStudentScope(studentEmail);
   const enrolledCourseNames = studentScope.courseNames.join(', ');
   const allowedPhrases = studentScope.allowedPhrases;
-
-  // Persist allowed phrases in conv-state so future turns (even if API fetch fails) still have scope
   await updateConvState(sessionId, { allowedPhrases, lastCourse: enrolledCourseNames });
 
-  // Meta: “what course am I enrolled in?”
   if (isEnrollmentMetaQuery(userMessage)) {
     const courseList = studentScope.courseNames.length ? `You’re enrolled in: **${studentScope.courseNames.join(', ')}**.` : `I couldn’t find active enrollments.`;
     if (responseMode === 'api') return { json: { data: { content: courseList } } };
     return { text: courseList };
   }
 
-  // Parse JSON array input: [{"course_topic":"...", "format":"..."}]
   let parsedInput = null;
   try {
     const tmp = JSON.parse(userMessage);
@@ -750,16 +782,12 @@ Return EXACTLY:
 { "data": { "faqs": [ { "question": "...", "answer": "..." } ] } }`;
       const text = await runWithToolsIfNeeded(chat, prompt);
       let payload = { data: { faqs: [] } };
-      try {
-        const parsed = JSON.parse(text);
-        payload = parsed?.data?.faqs ? parsed : payload;
-      } catch {}
+      try { const parsed = JSON.parse(text); payload = parsed?.data?.faqs ? parsed : payload; } catch {}
       await saveToHistory(sessionId, `JSON(faq): ${topic}`, JSON.stringify(payload), { lastTopic: topic, lastFormat: 'faq', lastSearchQuery: queryFromTopic });
       return { json: payload };
     }
 
     if (format === 'quiz') {
-      // 1) Generate quiz with answer TEXT + plain options
       const history = await getConversationHistory(sessionId);
       const chat = startChat(history, { generationConfig: { responseMimeType: 'application/json' } });
       const header = buildContextHeader(studentEmail, enrolledCourseNames, allowedPhrases, topic);
@@ -784,35 +812,18 @@ Return EXACTLY:
       const text = await runWithToolsIfNeeded(chat, prompt);
       let quiz = { data: { topic, questions: [] } };
       try { quiz = JSON.parse(text); } catch {}
-
-      // 2) Sanitize answers/options
-      const questions = Array.isArray(quiz?.data?.questions) ? quiz.data.questions : [];
-      for (const q of questions) {
-        q.options = Array.isArray(q.options) ? q.options.map(stripLabel) : [];
+      const questions = Array.isArray(quiz?.data?.questions) ? quiz.data.questions.map(q => {
+        const opts = Array.isArray(q.options) ? q.options.map(stripLabel) : [];
+        let correct = '';
         if (typeof q.correct_answer === 'string') {
           const idx = letterToIndex(q.correct_answer);
-          if (idx >= 0 && idx < q.options.length) q.correct_answer = q.options[idx];
-          else q.correct_answer = stripLabel(q.correct_answer);
-        } else {
-          q.correct_answer = '';
+          if (idx >= 0 && idx < opts.length) correct = opts[idx];
+          else correct = stripLabel(q.correct_answer);
         }
-      }
-
-      // 3) Enrich with validated articles (plus KB if relevant)
-      for (const q of questions) {
-        const kb = getKbArticles(topic);
-        const qText = typeof q?.question_text === 'string' ? q.question_text : '';
-        let arts = [];
-        if (qText) {
-          const query = `${normalizeQuery(topic)} ${normalizeQuery(qText)} site:w3schools.com OR site:geeksforgeeks.org OR site:sqlbolt.com OR site:mode.com OR site:docs.microsoft.com OR site:postgresql.org`;
-          const out = await search_web_for_articles({ query });
-          arts = (out.searchResults || []).slice(0, 2);
-        }
-        q.articles = [...kb.slice(0, 1), ...arts];
-      }
-
+        return { question_text: q.question_text || '', options: opts, correct_answer: correct || '' };
+      }) : [];
       const payload = { data: { topic, questions } };
-      await saveToHistory(sessionId, `JSON(quiz): ${topic}`, JSON.stringify(payload), { lastTopic: topic, lastFormat: 'quiz', lastSearchQuery: queryFromTopic });
+      await saveToHistory(sessionId, `JSON(quiz): ${topic}`, JSON.stringify(payload), { lastTopic: topic, lastFormat: 'quiz', lastSearchQuery: await buildSearchQuery({ sessionId, userMessage: topic, defaultTopic: topic, allowedPhrases }) });
       return { json: payload };
     }
 
@@ -896,7 +907,6 @@ Return EXACTLY:
       return { json: payload };
     }
     if (requestedFormat === 'quiz') {
-      // quiz: text answers + plain options + per-question articles
       const history = await getConversationHistory(sessionId);
       const chat = startChat(history, { generationConfig: { responseMimeType: 'application/json' } });
       const header = buildContextHeader(studentEmail, enrolledCourseNames, allowedPhrases, topicBase);
@@ -921,36 +931,21 @@ Return EXACTLY:
       const text = await runWithToolsIfNeeded(chat, prompt);
       let quiz = { data: { topic: topicBase, questions: [] } };
       try { quiz = JSON.parse(text); } catch {}
-
-      const questions = Array.isArray(quiz?.data?.questions) ? quiz.data.questions : [];
-      for (const q of questions) {
-        q.options = Array.isArray(q.options) ? q.options.map(stripLabel) : [];
+      const questions = Array.isArray(quiz?.data?.questions) ? quiz.data.questions.map(q => {
+        const opts = Array.isArray(q.options) ? q.options.map(stripLabel) : [];
+        let correct = '';
         if (typeof q.correct_answer === 'string') {
           const idx = letterToIndex(q.correct_answer);
-          if (idx >= 0 && idx < q.options.length) q.correct_answer = q.options[idx];
-          else q.correct_answer = stripLabel(q.correct_answer);
-        } else {
-          q.correct_answer = '';
+          if (idx >= 0 && idx < opts.length) correct = opts[idx];
+          else correct = stripLabel(q.correct_answer);
         }
-      }
-      for (const q of questions) {
-        const kb = getKbArticles(topicBase);
-        const qText = typeof q?.question_text === 'string' ? q.question_text : '';
-        let arts = [];
-        if (qText) {
-          const qQuery = `${normalizeQuery(topicBase)} ${normalizeQuery(qText)} site:w3schools.com OR site:geeksforgeeks.org OR site:sqlbolt.com OR site:mode.com OR site:docs.microsoft.com OR site:postgresql.org`;
-          const out = await search_web_for_articles({ query: qQuery });
-          arts = (out.searchResults || []).slice(0, 2);
-        }
-        q.articles = [...kb.slice(0, 1), ...arts];
-      }
-
+        return { question_text: q.question_text || '', options: opts, correct_answer: correct || '' };
+      }) : [];
       const payload = { data: { topic: topicBase, questions } };
       await saveToHistory(sessionId, `API(quiz): ${query}`, JSON.stringify(payload), { lastSearchQuery: query });
       return { json: payload };
     }
 
-    // default explanation
     const history = await getConversationHistory(sessionId);
     const chat = startChat(history);
     const header = buildContextHeader(studentEmail, enrolledCourseNames, allowedPhrases, topicBase);
@@ -977,28 +972,22 @@ Explain clearly and concisely strictly within the enrolled curriculum. Use concr
   if (requestedFormat === 'video') {
     const out = await search_youtube_for_videos({ query });
     const vids = out.searchResults || [];
-    if (!vids.length) {
-      const text = `I couldn't find reliable videos for **${topicForSlack}**.`;
-      await saveToHistory(sessionId, userMessage, text, { lastSearchQuery: query });
-      return { text };
-    }
-    const md = vids.map(v => `**${v.title}**\n${v.link}\n> ${v.snippet}`).join('\n\n');
-    await saveToHistory(sessionId, userMessage, md, { lastSearchQuery: query });
-    return { text: md };
+    const text = vids.length
+      ? vids.map(v => `**${v.title}**\n${v.link}\n> ${v.snippet}`).join('\n\n')
+      : `I couldn't find reliable videos for **${topicForSlack}**.`;
+    await saveToHistory(sessionId, userMessage, text, { lastSearchQuery: query });
+    return { text };
   }
 
   if (requestedFormat === 'article') {
     const kb = getKbArticles(query);
     const out = await search_web_for_articles({ query });
     const arts = [...kb, ...(out.searchResults || [])];
-    if (!arts.length) {
-      const text = `I couldn't find reliable articles for **${topicForSlack}**.`;
-      await saveToHistory(sessionId, userMessage, text, { lastSearchQuery: query });
-      return { text };
-    }
-    const md = arts.map(a => `**${a.title}**\n${a.link}\n> ${a.snippet}`).join('\n\n');
-    await saveToHistory(sessionId, userMessage, md, { lastSearchQuery: query });
-    return { text: md };
+    const text = arts.length
+      ? arts.map(a => `**${a.title}**\n${a.link}\n> ${a.snippet}`).join('\n\n')
+      : `I couldn't find reliable articles for **${topicForSlack}**.`;
+    await saveToHistory(sessionId, userMessage, text, { lastSearchQuery: query });
+    return { text };
   }
 
   if (requestedFormat === 'faq') {
@@ -1025,6 +1014,7 @@ Return EXACTLY:
   }
 
   if (requestedFormat === 'quiz') {
+    // Generate quiz JSON — Slack text-mode will handle interaction
     const history = await getConversationHistory(sessionId);
     const chat = startChat(history, { generationConfig: { responseMimeType: 'application/json' } });
     const header = buildContextHeader(studentEmail, enrolledCourseNames, allowedPhrases, topicForSlack);
@@ -1050,37 +1040,21 @@ Return EXACTLY:
     let quiz = { data: { topic: topicForSlack, questions: [] } };
     try { quiz = JSON.parse(text); } catch {}
 
-    const questions = Array.isArray(quiz?.data?.questions) ? quiz.data.questions : [];
-    for (const q of questions) {
-      q.options = Array.isArray(q.options) ? q.options.map(stripLabel) : [];
+    const questions = Array.isArray(quiz?.data?.questions) ? quiz.data.questions.map(q => {
+      const opts = Array.isArray(q.options) ? q.options.map(stripLabel) : [];
+      let correct = '';
       if (typeof q.correct_answer === 'string') {
         const idx = letterToIndex(q.correct_answer);
-        if (idx >= 0 && idx < q.options.length) q.correct_answer = q.options[idx];
-        else q.correct_answer = stripLabel(q.correct_answer);
-      } else {
-        q.correct_answer = '';
+        if (idx >= 0 && idx < opts.length) correct = opts[idx];
+        else correct = stripLabel(q.correct_answer);
       }
-    }
-    for (const q of questions) {
-      const kb = getKbArticles(topicForSlack);
-      const qText = typeof q?.question_text === 'string' ? q.question_text : '';
-      let arts = [];
-      if (qText) {
-        const qQuery = `${normalizeQuery(topicForSlack)} ${normalizeQuery(qText)} site:w3schools.com OR site:geeksforgeeks.org OR site:sqlbolt.com OR site:mode.com OR site:docs.microsoft.com OR site:postgresql.org`;
-        const out = await search_web_for_articles({ query: qQuery });
-        arts = (out.searchResults || []).slice(0, 2);
-      }
-      q.articles = [...kb.slice(0, 1), ...arts];
-    }
+      return { question_text: q.question_text || '', options: opts, correct_answer: correct || '' };
+    }) : [];
 
-    const md = questions.length
-      ? `I created a quiz on **${topicForSlack}** (10 questions).`
-      : `I couldn't generate a quiz right now.`;
-    await saveToHistory(sessionId, userMessage, md, { lastSearchQuery: query });
-    return { text: md };
+    return { quiz: { topic: quiz?.data?.topic || topicForSlack, questions } };
   }
 
-  // Else: regular Slack explanation
+  // Default Slack explanation
   const history = await getConversationHistory(sessionId);
   const chat = startChat(history);
   const header = buildContextHeader(studentEmail, enrolledCourseNames, allowedPhrases, topicForSlack);
@@ -1097,7 +1071,7 @@ Reply in Markdown. Provide a concise, accurate explanation drawn from the curric
 }
 
 // -----------------------------------------------------------------------------
-// API Endpoint
+// API Endpoint (UNCHANGED)
 // -----------------------------------------------------------------------------
 receiver.router.post('/api/chat', async (req, res) => {
   try {
@@ -1132,21 +1106,113 @@ receiver.router.post('/api/chat', async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// Slack handlers
+// Slack handlers — TEXT quiz flow (no blocks)
 // -----------------------------------------------------------------------------
+async function handleQuizAnswerIfAny({ event, client }) {
+  const thread = event.thread_ts || event.ts;
+  const key = makeQuizKey({ channel: event.channel, thread, user: event.user });
+  const session = await getQuizSession(key);
+
+  if (!session || session.completed) return false; // nothing to handle
+
+  // Treat this message as the answer for current question
+  const idx = session.index || 0;
+  const q = session.questions[idx];
+  const selIdx = parseAnswerIndex(event.text || '', q.options || []);
+  if (selIdx < 0 || selIdx >= (q.options || []).length) {
+    await client.chat.postMessage({
+      channel: session.channel,
+      thread_ts: session.thread_ts,
+      text: "I didn't catch that. Please reply with *A, B, C, D*, *1–4*, or the exact option text."
+    });
+    return true;
+  }
+
+  const selected = q.options[selIdx];
+  const correct = selected === q.correct_answer;
+
+  const answers = session.answers || [];
+  answers.push({
+    selected,
+    correct_answer: q.correct_answer,
+    question: q.question_text,
+    correct
+  });
+
+  let score = (session.score || 0) + (correct ? 1 : 0);
+  let nextIndex = idx + 1;
+
+  await updateQuizSession(key, { answers, score, index: nextIndex });
+
+  // feedback for this question
+  await client.chat.postMessage({
+    channel: session.channel,
+    thread_ts: session.thread_ts,
+    text: fmtStepFeedback({ correct, correctAns: q.correct_answer, selected })
+  });
+
+  if (nextIndex < session.questions.length) {
+    const nextQ = session.questions[nextIndex];
+    await client.chat.postMessage({
+      channel: session.channel,
+      thread_ts: session.thread_ts,
+      text: fmtQuestionText({ topic: session.topic, index: nextIndex, total: session.questions.length, q: nextQ })
+    });
+  } else {
+    await completeQuizSession(key, {});
+    const summary = fmtSummary({ topic: session.topic, score, total: session.questions.length, answers });
+    await client.chat.postMessage({
+      channel: session.channel,
+      thread_ts: session.thread_ts,
+      text: summary
+    });
+  }
+
+  return true;
+}
+
+async function startQuizSession({ event, client, quiz }) {
+  const key = makeQuizKey({ channel: event.channel, thread: event.thread_ts || event.ts, user: event.user });
+  const session = {
+    user: event.user,
+    channel: event.channel,
+    thread_ts: event.thread_ts || event.ts,
+    topic: quiz.topic,
+    questions: quiz.questions,
+    index: 0,
+    score: 0,
+    answers: []
+  };
+  await createQuizSession(key, session);
+
+  // Intro + first question
+  await client.chat.postMessage({
+    channel: session.channel,
+    thread_ts: session.thread_ts,
+    text: `Starting quiz on *${quiz.topic}*.\nI'll ask one question at a time. Reply with *A/B/C/D*, *1–4*, or the option text.`
+  });
+
+  const q0 = session.questions[0];
+  await client.chat.postMessage({
+    channel: session.channel,
+    thread_ts: session.thread_ts,
+    text: fmtQuestionText({ topic: session.topic, index: 0, total: session.questions.length, q: q0 })
+  });
+}
+
 async function handleSlackEvent({ event, client, say }) {
   try {
     if (!await acquireEventLock(event.event_ts || event.ts)) return;
 
-    // More reliable email fetch + normalization
+    // Resolve student email
     let studentEmail;
     try {
-      const info = await client.users.info({ user: event.user }); // preferred
+      const info = await client.users.info({ user: event.user });
       studentEmail = info?.user?.profile?.email;
     } catch (_) {}
     if (!studentEmail) {
       try {
-        const prof = await client.users.profile.get({ user: event.user }); // fallback
+        const prof = await client.users.profile.get({ user: event.user });
         studentEmail = prof?.profile?.email;
       } catch (_) {}
     }
@@ -1157,21 +1223,35 @@ async function handleSlackEvent({ event, client, say }) {
       return;
     }
 
-    const sessionId = `${event.channel}_${event.thread_ts || event.ts}`;
-    const userMessage = (event.text || '').replace(/<@.*?>/g, '').trim();
+    // If a quiz is in progress in this thread for this user, treat message as answer
+    const handled = await handleQuizAnswerIfAny({ event, client });
+    if (handled) return;
 
-    const { text } = await processUserRequest({
+    const sessionId = `${event.channel}_${event.thread_ts || event.ts}`;
+    const raw = (event.text || '').replace(/<@.*?>/g, '').trim();
+
+    // Quick retake hook
+    if (/^\s*retake\s+quiz\b/i.test(raw)) {
+      await say({ text: "Okay, what topic should I use for the quiz?", thread_ts: event.thread_ts || event.ts });
+      return;
+    }
+
+    const result = await processUserRequest({
       sessionId,
-      userMessage,
+      userMessage: raw,
       studentEmail,
       supportFormat: null,
       responseMode: 'slack'
     });
 
-    await say({ text, thread_ts: event.thread_ts || event.ts });
+    if (result && result.quiz && Array.isArray(result.quiz.questions) && result.quiz.questions.length) {
+      await startQuizSession({ event, client, quiz: result.quiz });
+      return;
+    }
+
+    await say({ text: result.text || 'Done.', thread_ts: event.thread_ts || event.ts });
 
   } catch (error) {
-    // Friendly message when Slack email isn’t enrolled
     const msg = String(error.message || '').includes('Could not verify student enrollment.')
       ? "Sorry, an error occurred: we can’t identify you as a student, kindly ensure you are signed into Slack with the same email address you used for your admission."
       : `Sorry, an error occurred: ${error.message}`;
@@ -1179,7 +1259,82 @@ async function handleSlackEvent({ event, client, say }) {
   }
 }
 
-app.event('app_mention', handleSlackEvent);
+receiver.router.get('/veritas/models', async (req, res) => {
+  try {
+    const API_KEY = process.env.GEMINI_API_KEY;
+    if (!API_KEY) {
+      return res.status(500).json({ error: 'GEMINI_API_KEY is not set in env.' });
+    }
+
+    const requestedVer = (req.query.ver || '').toString().toLowerCase();
+    const versions = (requestedVer === 'v1' || requestedVer === 'v1beta') ? [requestedVer] : ['v1', 'v1beta'];
+
+    const capFilter = (req.query.cap || '').toString().trim();       // e.g. 'generateContent'
+    const nameFilter = (req.query.name || '').toString().toLowerCase();
+
+    const all = [];
+    for (const ver of versions) {
+      const url = `https://generativelanguage.googleapis.com/${ver}/models?key=${encodeURIComponent(API_KEY)}`;
+      // Use your existing fetch polyfill
+      const r = await fetch(url);
+      const j = await r.json();
+
+      if (!r.ok) {
+        // Keep going if one version fails, but include the error in the payload
+        all.push({ _error: true, version: ver, status: r.status, body: j });
+        continue;
+      }
+
+      const models = Array.isArray(j.models) ? j.models : [];
+      for (const m of models) {
+        const supported = m.supportedGenerationMethods || m.supported_actions || [];
+        const normalized = {
+          version: ver,
+          name: m.name || m.baseModelId || '',
+          displayName: m.displayName || m.description || '',
+          supportedGenerationMethods: supported,
+          supportsGenerateContent: supported.includes('generateContent'),
+          raw: m, // optional: remove if you don’t want the full object
+        };
+        all.push(normalized);
+      }
+    }
+
+    // Optional filters
+    let out = all.filter(x => !x._error);
+    if (capFilter) {
+      out = out.filter(x => (x.supportedGenerationMethods || []).includes(capFilter));
+    }
+    if (nameFilter) {
+      out = out.filter(x =>
+        (x.name || '').toLowerCase().includes(nameFilter) ||
+        (x.displayName || '').toLowerCase().includes(nameFilter)
+      );
+    }
+
+    // Collate any version errors
+    const errors = all.filter(x => x._error);
+
+    return res.status(200).json({
+      ok: true,
+      filters: {
+        ver: versions,
+        cap: capFilter || null,
+        name: nameFilter || null,
+      },
+      count: out.length,
+      models: out.sort((a, b) => (a.version + a.name).localeCompare(b.version + b.name)),
+      errors: errors.length ? errors : undefined
+    });
+  } catch (err) {
+    return res.status(500).json({ error: 'Failed to list models', details: err.message });
+  }
+})
+
+app.event('app_mention', async ({ event, say, client }) => {
+  if (event.text) await handleSlackEvent({ event, say, client });
+});
+
 app.message(async ({ message, say, client }) => {
   if (message.channel_type === 'im' && !message.bot_id && message.text) {
     await handleSlackEvent({ event: message, client, say });
