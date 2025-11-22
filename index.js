@@ -1343,3 +1343,11 @@ app.message(async ({ message, say, client }) => {
 
 // For Cloud Functions / serverless
 exports.slackBotHandler = receiver.app;
+
+exports.receiverApp = receiver.app;
+exports.getStudentScope = getStudentScope;
+exports.buildContextHeader = buildContextHeader;
+exports.BASE_SYSTEM_INSTRUCTION = BASE_SYSTEM_INSTRUCTION;
+exports.toolDefs = toolDefs;
+exports.availableTools = availableTools;
+exports.normalizeEmail = normalizeEmail;
