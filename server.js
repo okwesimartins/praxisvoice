@@ -276,13 +276,16 @@ const toolDefs = [{
 }];
 
 // -----------------------------------------------------------------------------
-// Gemini Live API bridge  ✅ FIXED
+// Gemini Live API bridge  ✅ FIXED FOR RAW WS
 // -----------------------------------------------------------------------------
 const GEMINI_LIVE_WS =
   "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
-// Use a Live-capable model. Default to your env if set.
-const LIVE_MODEL = process.env.GEMINI_LIVE_MODEL || "gemini-2.5-flash-native-audio-preview-09-2025";
+// ✅ IMPORTANT: raw WS requires models/<id>
+const LIVE_MODEL_ENV =
+  process.env.GEMINI_LIVE_MODEL || "gemini-2.5-flash-native-audio-preview-09-2025";
+const LIVE_MODEL =
+  LIVE_MODEL_ENV.startsWith("models/") ? LIVE_MODEL_ENV : `models/${LIVE_MODEL_ENV}`;
 
 const BASE_SYSTEM_INSTRUCTION = `
 You are Praxis, a specialized AI tutor for Pluralcode Academy.
@@ -304,16 +307,17 @@ function openGeminiLiveSocket({ systemInstruction, tools }) {
   const ws = new WebSocket(`${GEMINI_LIVE_WS}?key=${encodeURIComponent(apiKey)}`);
 
   ws.on("open", () => {
-    // ✅ Live WS spec: systemInstruction MUST be a plain string
     ws.send(JSON.stringify({
       setup: {
         model: LIVE_MODEL,
         generationConfig: {
+          // If you get 1007 again, switch to ["AUDIO"] only.
           responseModalities: ["AUDIO", "TEXT"],
           temperature: 0.4,
           maxOutputTokens: 512,
         },
-        systemInstruction: { parts: [{ text: systemInstruction }] }, // <-- FIX
+        // Keep Content form (works for WS)
+        systemInstruction: { parts: [{ text: systemInstruction }] },
         tools,
       },
     }));
@@ -362,10 +366,10 @@ wss.on("connection", (clientWs) => {
           studentEmail, enrolledCourseNames, allowedPhrases
         );
 
-        const systemInstruction = `${BASE_SYSTEM_INSTRUCTION}\n\n${header}`;
+        const sys = `${BASE_SYSTEM_INSTRUCTION}\n\n${header}`;
 
         geminiWs = openGeminiLiveSocket({
-          systemInstruction,
+          systemInstruction: sys,
           tools: toolDefs,
         });
 
@@ -438,7 +442,7 @@ wss.on("connection", (clientWs) => {
         realtimeInput: {
           audio: {
             mimeType: "audio/pcm;rate=16000",
-            data: msg.data, // base64 PCM16 mono 16k
+            data: msg.data,
           },
         },
       }));
