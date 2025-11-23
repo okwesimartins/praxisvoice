@@ -1,8 +1,9 @@
 /**
- * server.js — Single-file Praxis Voice on Cloud Run
- * - Express health + serves a simple voice.html
+ * server.js — Single-file Praxis Voice on Cloud Run (Buildpacks OK)
+ * - Express health + serves /voice test HTML
  * - WS /ws: browser audio <-> Gemini Live API
  * - Enforces LMS key + student course scope
+ * - Supports tool calling (Google Web + YouTube search)
  */
 
 if (process.env.NODE_ENV !== "production") {
@@ -24,6 +25,10 @@ if (!fetchFn) {
 }
 const fetch = (...args) => fetchFn(...args);
 
+// Crash logging so Cloud Run shows real reasons
+process.on("uncaughtException", (e) => console.error("UNCAUGHT_EXCEPTION", e));
+process.on("unhandledRejection", (e) => console.error("UNHANDLED_REJECTION", e));
+
 // -----------------------------------------------------------------------------
 // EXPRESS APP (health + voice test page)
 // -----------------------------------------------------------------------------
@@ -32,7 +37,6 @@ app.use(cors());
 app.use(express.json());
 
 app.get("/", (req, res) => res.type("text").send("ok"));
-
 app.get("/voice", (req, res) => {
   res.setHeader("content-type", "text/html");
   res.send(VOICE_HTML);
@@ -54,43 +58,26 @@ const addSynonyms = (phrase, bag) => {
   if (!display) return bag;
   bag.add(display);
 
-  if (/javascript/.test(p)) {
-    bag.add("javascript");
-    bag.add("js");
-  }
+  if (/javascript/.test(p)) { bag.add("javascript"); bag.add("js"); }
 
   if (/python/.test(p) || /data\s*analytics?/.test(p)) {
     [
-      "python",
-      "numpy",
-      "pandas",
-      "matplotlib",
-      "seaborn",
-      "scikit-learn",
-      "jupyter",
-      "anaconda",
-      "etl",
-      "data wrangling",
+      "python","numpy","pandas","matplotlib","seaborn","scikit-learn",
+      "jupyter","anaconda","etl","data wrangling",
     ].forEach((x) => bag.add(x));
   }
   if (/\bsql\b/.test(p)) bag.add("sql");
   if (/excel/.test(p)) bag.add("excel");
   if (/power\s*bi|powerbi|pbi/.test(p)) {
-    bag.add("power bi");
-    bag.add("pbi");
-    bag.add("powerbi");
+    bag.add("power bi"); bag.add("pbi"); bag.add("powerbi");
   }
-  if (/machine\s*learning/.test(p)) {
-    bag.add("ml");
-    bag.add("machine learning");
-  }
+  if (/machine\s*learning/.test(p)) { bag.add("ml"); bag.add("machine learning"); }
   if (/web\s*scraping/.test(p)) bag.add("web scraping");
   if (/dax/.test(p)) bag.add("dax");
 
   if (/\bscrum\b|agile/.test(p)) {
     "scrum,agile,scrum events,scrum ceremonies,agile ceremonies,sprint planning,daily scrum,daily standup,sprint review,sprint retrospective,backlog refinement,product backlog refinement"
-      .split(",")
-      .forEach((x) => bag.add(x));
+      .split(",").forEach((x) => bag.add(x));
   }
   if (/kanban/.test(p)) bag.add("kanban");
 
@@ -98,22 +85,10 @@ const addSynonyms = (phrase, bag) => {
 };
 
 const TOPIC_STRING_KEYS = new Set([
-  "coursename",
-  "course",
-  "course_name",
-  "name",
-  "title",
-  "topic",
-  "topic_name",
-  "label",
-  "module",
-  "module_name",
-  "lesson",
-  "lesson_name",
-  "chapter",
-  "section",
-  "unit",
+  "coursename","course","course_name","name","title","topic","topic_name","label",
+  "module","module_name","lesson","lesson_name","chapter","section","unit",
 ]);
+
 function harvestCourseStrings(node, bag) {
   if (!node) return;
   if (Array.isArray(node)) {
@@ -126,12 +101,13 @@ function harvestCourseStrings(node, bag) {
       if (typeof v === "string") {
         if (TOPIC_STRING_KEYS.has(key)) {
           const s = v.trim();
-          if (s && !/^https?:\/\//i.test(s) && s.length <= 200)
-            addSynonyms(s, bag);
+          if (s && !/^https?:\/\//i.test(s) && s.length <= 200) addSynonyms(s, bag);
         }
       } else if (Array.isArray(v)) {
         for (const child of v) harvestCourseStrings(child, bag);
-      } else if (typeof v === "object" && v) harvestCourseStrings(v, bag);
+      } else if (typeof v === "object" && v) {
+        harvestCourseStrings(v, bag);
+      }
     }
   }
 }
@@ -140,21 +116,10 @@ const buildAllowedFromPayload = (data) => {
   const phrases = new Set();
   const courseNames = [];
 
-  const enrolled = Array.isArray(data.enrolled_courses)
-    ? data.enrolled_courses
-    : [];
+  const enrolled = Array.isArray(data.enrolled_courses) ? data.enrolled_courses : [];
   for (const c of enrolled) {
-    const courseName = (
-      c.coursename ||
-      c.course_name ||
-      c.name ||
-      c.title ||
-      ""
-    ).trim();
-    if (courseName) {
-      courseNames.push(courseName);
-      addSynonyms(courseName, phrases);
-    }
+    const courseName = (c.coursename || c.course_name || c.name || c.title || "").trim();
+    if (courseName) { courseNames.push(courseName); addSynonyms(courseName, phrases); }
     if (c.course_topics) harvestCourseStrings(c.course_topics, phrases);
     else harvestCourseStrings(c, phrases);
   }
@@ -166,9 +131,7 @@ const buildAllowedFromPayload = (data) => {
 };
 
 const withTimeout = async (promise, ms, msg = "Timed out") => {
-  const timeout = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error(msg)), ms)
-  );
+  const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error(msg)), ms));
   return Promise.race([promise, timeout]);
 };
 
@@ -176,18 +139,13 @@ async function getStudentScope(email) {
   const clean = normalizeEmail(email);
   if (!clean) throw new Error("Student email is missing.");
 
-  const url = `${PLURALCODE_API_BASE}/student/praxis_get_student_courses?email=${encodeURIComponent(
-    clean
-  )}`;
-
+  const url = `${PLURALCODE_API_BASE}/student/praxis_get_student_courses?email=${encodeURIComponent(clean)}`;
   const response = await withTimeout(fetch(url), 8000, "Pluralcode API timeout");
-  if (!response.ok)
-    throw new Error(`Pluralcode API failed with status ${response.status}`);
+  if (!response.ok) throw new Error(`Pluralcode API failed with status ${response.status}`);
+
   const data = await response.json();
   const scope = buildAllowedFromPayload(data);
-
-  if (!scope.courseNames.length)
-    throw new Error("No active course enrollment found.");
+  if (!scope.courseNames.length) throw new Error("No active course enrollment found.");
   return scope;
 }
 
@@ -207,7 +165,7 @@ Enrolled Course(s): "${enrolledCourseNames}"
 }
 
 // -----------------------------------------------------------------------------
-// Google search tools (same behavior as your old code)
+// Google search tools
 // -----------------------------------------------------------------------------
 const Google_Search_API_KEY = process.env.Google_Search_API_KEY;
 const Google_Search_CX_ID = process.env.Google_Search_CX_ID;
@@ -219,18 +177,13 @@ const youtube = google.youtube({
 
 const isLikelyGoodUrl = (url) => {
   if (!/^https?:\/\//i.test(url)) return false;
-  if (
-    /webcache\.googleusercontent\.com|translate\.googleusercontent\.com|accounts\.google\.com/i.test(
-      url
-    )
-  )
+  if (/webcache\.googleusercontent\.com|translate\.googleusercontent\.com|accounts\.google\.com/i.test(url))
     return false;
   return true;
 };
 
 const validateUrl = async (url) => {
-  if (url.includes("pluralcode.academy") || url.includes("drive.google.com"))
-    return true;
+  if (url.includes("pluralcode.academy") || url.includes("drive.google.com")) return true;
   if (!isLikelyGoodUrl(url)) return false;
   try {
     const res = await withTimeout(fetch(url, { method: "HEAD" }), 3500);
@@ -276,14 +229,11 @@ async function search_youtube_for_videos({ query }) {
 }
 
 async function search_web_for_articles({ query }) {
-  const url = `https://www.googleapis.com/customsearch/v1?key=${Google_Search_API_KEY}&cx=${Google_Search_CX_ID}&q=${encodeURIComponent(
-    query
-  )}`;
+  const url = `https://www.googleapis.com/customsearch/v1?key=${Google_Search_API_KEY}&cx=${Google_Search_CX_ID}&q=${encodeURIComponent(query)}`;
   const res = await withTimeout(fetch(url), 6000, "Web search timeout");
-  if (!res.ok)
-    throw new Error(`Google Search API responded with status ${res.status}`);
-  const data = await res.json();
+  if (!res.ok) throw new Error(`Google Search API responded with status ${res.status}`);
 
+  const data = await res.json();
   const items = (data.items || []).map((i) => ({
     title: i.title,
     link: i.link,
@@ -298,41 +248,32 @@ async function search_web_for_articles({ query }) {
 
 const availableTools = { search_youtube_for_videos, search_web_for_articles };
 
-const toolDefs = [
-  {
-    functionDeclarations: [
-      {
-        name: "search_web_for_articles",
-        description:
-          "Search the web for high-quality articles, blog posts, and official documentation.",
-        parameters: {
-          type: "OBJECT",
-          properties: {
-            query: {
-              type: "STRING",
-              description: "A detailed search query.",
-            },
-          },
-          required: ["query"],
+const toolDefs = [{
+  functionDeclarations: [
+    {
+      name: "search_web_for_articles",
+      description: "Search the web for high-quality articles, blog posts, and official documentation.",
+      parameters: {
+        type: "OBJECT",
+        properties: {
+          query: { type: "STRING", description: "A detailed search query." },
         },
+        required: ["query"],
       },
-      {
-        name: "search_youtube_for_videos",
-        description: "Search YouTube for relevant tutorial videos.",
-        parameters: {
-          type: "OBJECT",
-          properties: {
-            query: {
-              type: "STRING",
-              description: "A detailed search query.",
-            },
-          },
-          required: ["query"],
+    },
+    {
+      name: "search_youtube_for_videos",
+      description: "Search YouTube for relevant tutorial videos.",
+      parameters: {
+        type: "OBJECT",
+        properties: {
+          query: { type: "STRING", description: "A detailed search query." },
         },
+        required: ["query"],
       },
-    ],
-  },
-];
+    },
+  ],
+}];
 
 // -----------------------------------------------------------------------------
 // Gemini Live API bridge
@@ -340,9 +281,11 @@ const toolDefs = [
 const GEMINI_LIVE_WS =
   "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
-const LIVE_MODEL =
-  process.env.GEMINI_LIVE_MODEL ||
-  "gemini-2.5-flash-native-audio-preview-09-2025";
+// ✅ Supported Live model for this endpoint
+// Default to gemini-2.0-flash-exp (works with bidiGenerateContent). :contentReference[oaicite:1]{index=1}
+const LIVE_MODEL_ENV = process.env.GEMINI_LIVE_MODEL || "gemini-2.0-flash-exp";
+const normalizeLiveModel = (m) => (m.startsWith("models/") ? m : `models/${m}`);
+const LIVE_MODEL = normalizeLiveModel(LIVE_MODEL_ENV);
 
 const BASE_SYSTEM_INSTRUCTION = `
 You are Praxis, a specialized AI tutor for Pluralcode Academy.
@@ -364,23 +307,19 @@ function openGeminiLiveSocket({ systemInstruction, tools }) {
   const ws = new WebSocket(`${GEMINI_LIVE_WS}?key=${encodeURIComponent(apiKey)}`);
 
   ws.on("open", () => {
-    ws.send(
-      JSON.stringify({
-        setup: {
-          model: LIVE_MODEL,
-          generationConfig: {
-            responseModalities: ["AUDIO", "TEXT"],
-            temperature: 0.4,
-            maxOutputTokens: 512,
-          },
-          // IMPORTANT: Live API requires Content, not string. :contentReference[oaicite:1]{index=1}
-          systemInstruction: {
-            parts: [{ text: systemInstruction }],
-          },
-          tools,
+    ws.send(JSON.stringify({
+      setup: {
+        model: LIVE_MODEL,
+        generationConfig: {
+          responseModalities: ["AUDIO", "TEXT"],
+          temperature: 0.4,
+          maxOutputTokens: 512,
         },
-      })
-    );
+        // Live API requires Content object
+        systemInstruction: { parts: [{ text: systemInstruction }] },
+        tools,
+      },
+    }));
   });
 
   return ws;
@@ -404,11 +343,7 @@ wss.on("connection", (clientWs) => {
 
   clientWs.on("message", async (raw) => {
     let msg;
-    try {
-      msg = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
+    try { msg = JSON.parse(raw.toString()); } catch { return; }
 
     if (msg.type === "start") {
       try {
@@ -427,9 +362,7 @@ wss.on("connection", (clientWs) => {
         const allowedPhrases = scope.allowedPhrases;
 
         const header = buildContextHeader(
-          studentEmail,
-          enrolledCourseNames,
-          allowedPhrases
+          studentEmail, enrolledCourseNames, allowedPhrases
         );
 
         const systemInstruction = `${BASE_SYSTEM_INSTRUCTION}\n\n${header}`;
@@ -441,11 +374,7 @@ wss.on("connection", (clientWs) => {
 
         geminiWs.on("message", async (data) => {
           let gm;
-          try {
-            gm = JSON.parse(data.toString());
-          } catch {
-            return;
-          }
+          try { gm = JSON.parse(data.toString()); } catch { return; }
 
           if (gm.setupComplete) {
             sendClient({ type: "ready", sessionId });
@@ -478,9 +407,7 @@ wss.on("connection", (clientWs) => {
               });
             }
             if (functionResponses.length) {
-              geminiWs.send(
-                JSON.stringify({ toolResponse: { functionResponses } })
-              );
+              geminiWs.send(JSON.stringify({ toolResponse: { functionResponses } }));
             }
           }
 
@@ -498,11 +425,9 @@ wss.on("connection", (clientWs) => {
         });
 
         geminiWs.on("error", (e) => {
-          sendClient({
-            type: "error",
-            error: e.message || "Gemini WS error",
-          });
+          sendClient({ type: "error", error: e.message || "Gemini WS error" });
         });
+
       } catch (e) {
         sendClient({ type: "error", error: e.message });
       }
@@ -512,32 +437,28 @@ wss.on("connection", (clientWs) => {
     if (!geminiWs || geminiWs.readyState !== WebSocket.OPEN) return;
 
     if (msg.type === "audio") {
-      geminiWs.send(
-        JSON.stringify({
-          realtimeInput: {
-            audio: {
-              mimeType: "audio/pcm;rate=16000",
-              data: msg.data, // base64 PCM16 mono 16k
-            },
+      geminiWs.send(JSON.stringify({
+        realtimeInput: {
+          audio: {
+            mimeType: "audio/pcm;rate=16000",
+            data: msg.data, // base64 PCM16 mono 16k
           },
-        })
-      );
+        },
+      }));
       return;
     }
 
     if (msg.type === "text") {
-      geminiWs.send(
-        JSON.stringify({
-          realtimeInput: { text: msg.text || "" },
-        })
-      );
+      geminiWs.send(JSON.stringify({
+        realtimeInput: { text: msg.text || "" },
+      }));
       return;
     }
 
     if (msg.type === "stop") {
-      geminiWs.send(
-        JSON.stringify({ realtimeInput: { audioStreamEnd: true } })
-      );
+      geminiWs.send(JSON.stringify({
+        realtimeInput: { audioStreamEnd: true },
+      }));
       return;
     }
   });
@@ -549,7 +470,7 @@ wss.on("connection", (clientWs) => {
 
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, "0.0.0.0", () =>
-  console.log(`Praxis Voice listening on ${PORT}`)
+  console.log(`Praxis Voice listening on ${PORT}, model=${LIVE_MODEL}`)
 );
 
 // -----------------------------------------------------------------------------
@@ -627,7 +548,6 @@ const VOICE_HTML = `
     return out;
   }
 
-  // crude downsample to 16k mono
   function downsampleBuffer(buffer, sampleRate, outRate = 16000) {
     if (outRate === sampleRate) return buffer;
     const ratio = sampleRate / outRate;
@@ -715,18 +635,9 @@ const VOICE_HTML = `
         await startMic();
       }
 
-      if (msg.type === "text") {
-        log("AI:", msg.text);
-      }
-
-      if (msg.type === "audio") {
-        if (!audioCtx) return;
-        playPcm16(msg.data);
-      }
-
-      if (msg.type === "error") {
-        log("ERROR:", msg.error);
-      }
+      if (msg.type === "text") log("AI:", msg.text);
+      if (msg.type === "audio") { if (audioCtx) playPcm16(msg.data); }
+      if (msg.type === "error") log("ERROR:", msg.error);
     };
 
     ws.onclose = () => {
