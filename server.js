@@ -313,7 +313,7 @@ function openGeminiLiveSocket({ systemInstruction, tools }) {
           temperature: 0.4,
           maxOutputTokens: 512,
         },
-        systemInstruction: systemInstruction, // <-- FIX
+        systemInstruction: { parts: [{ text: systemInstruction }] }, // <-- FIX
         tools,
       },
     }));
