@@ -10,10 +10,11 @@
     "@google/generative-ai": "^0.15.0",
     "cors": "^2.8.5",
     "dotenv": "^17.2.0",
+    "express": "^4.19.2",
+    "express-ws": "^5.0.2",
     "googleapis": "^140.0.1",
     "node-fetch": "^3.3.0",
     "uuid": "^11.1.0",
-    "ws": "^8.18.3",
-    "express": "^4.19.2"
+    "ws": "^8.18.3"
   }
 }
