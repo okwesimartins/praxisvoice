@@ -4,11 +4,21 @@
  * - Adds /ws/voice to bridge browser audio <-> Gemini Live
  */
 
-// const http = require("http");
-// const WebSocket = require("ws");
-// const { v4: uuidv4 } = require("uuid");
+const http = require("http");
+const WebSocket = require("ws");
+const crypto = require("crypto");
 
-// const praxis = require("./index.js");
+// Crash logging so Cloud Run shows the real reason if anything dies early
+// process.on("uncaughtException", (e) => console.error("UNCAUGHT_EXCEPTION", e));
+// process.on("unhandledRejection", (e) => console.error("UNHANDLED_REJECTION", e));
+
+// let praxis;
+// try {
+//   praxis = require("./index.js");
+// } catch (e) {
+//   console.error("FAILED_LOADING_INDEX_JS", e);
+//   process.exit(1);
+// }
 
 // const {
 //   receiverApp,
@@ -34,29 +44,34 @@
 //   const ws = new WebSocket(`${GEMINI_LIVE_WS}?key=${encodeURIComponent(apiKey)}`);
 
 //   ws.on("open", () => {
-//     ws.send(JSON.stringify({
-//       setup: {
-//         model: LIVE_MODEL,
-//         generationConfig: {
-//           responseModalities: ["AUDIO", "TEXT"],
-//           temperature: 0.4,
-//           maxOutputTokens: 512,
+//     ws.send(
+//       JSON.stringify({
+//         setup: {
+//           model: LIVE_MODEL,
+//           generationConfig: {
+//             responseModalities: ["AUDIO", "TEXT"],
+//             temperature: 0.4,
+//             maxOutputTokens: 512,
+//           },
+//           systemInstruction,
+//           tools,
 //         },
-//         systemInstruction,
-//         tools,
-//       }
-//     }));
+//       })
+//     );
 //   });
 
 //   return ws;
 // }
 
+// // Cloud Run HTTP server
 // const server = http.createServer(receiverApp);
+
+// // WebSocket server for browser voice
 // const wss = new WebSocket.Server({ server, path: "/ws/voice" });
 
 // wss.on("connection", (clientWs) => {
 //   let geminiWs = null;
-//   let sessionId = uuidv4();
+//   let sessionId = crypto.randomUUID();
 
 //   const sendClient = (obj) => {
 //     if (clientWs.readyState === WebSocket.OPEN) {
@@ -66,8 +81,11 @@
 
 //   clientWs.on("message", async (raw) => {
 //     let msg;
-//     try { msg = JSON.parse(raw.toString()); }
-//     catch { return; }
+//     try {
+//       msg = JSON.parse(raw.toString());
+//     } catch {
+//       return;
+//     }
 
 //     // START
 //     if (msg.type === "start") {
@@ -93,18 +111,20 @@
 //           "(live voice session)"
 //         );
 
-//         const systemInstruction =
-//           `${BASE_SYSTEM_INSTRUCTION}\n\n${header}`;
+//         const systemInstruction = `${BASE_SYSTEM_INSTRUCTION}\n\n${header}`;
 
 //         geminiWs = openGeminiLiveSocket({
 //           systemInstruction,
-//           tools: toolDefs, // keeps your tools working in voice
+//           tools: toolDefs, // keeps tools working in voice
 //         });
 
 //         geminiWs.on("message", async (data) => {
 //           let gm;
-//           try { gm = JSON.parse(data.toString()); }
-//           catch { return; }
+//           try {
+//             gm = JSON.parse(data.toString());
+//           } catch {
+//             return;
+//           }
 
 //           if (gm.setupComplete) {
 //             sendClient({ type: "ready", sessionId });
@@ -137,7 +157,9 @@
 //               });
 //             }
 //             if (functionResponses.length) {
-//               geminiWs.send(JSON.stringify({ toolResponse: { functionResponses } }));
+//               geminiWs.send(
+//                 JSON.stringify({ toolResponse: { functionResponses } })
+//               );
 //             }
 //           }
 
@@ -147,14 +169,19 @@
 //         });
 
 //         geminiWs.on("close", (code, reason) => {
-//           sendClient({ type: "error", error: `Gemini WS closed: ${code} ${reason || ""}` });
+//           sendClient({
+//             type: "error",
+//             error: `Gemini WS closed: ${code} ${reason || ""}`,
+//           });
 //           clientWs.close();
 //         });
 
 //         geminiWs.on("error", (e) => {
-//           sendClient({ type: "error", error: e.message || "Gemini WS error" });
+//           sendClient({
+//             type: "error",
+//             error: e.message || "Gemini WS error",
+//           });
 //         });
-
 //       } catch (e) {
 //         sendClient({ type: "error", error: e.message });
 //       }
@@ -165,30 +192,36 @@
 
 //     // AUDIO IN (PCM16k base64)
 //     if (msg.type === "audio") {
-//       geminiWs.send(JSON.stringify({
-//         realtimeInput: {
-//           audio: {
-//             mimeType: "audio/pcm;rate=16000",
-//             data: msg.data
-//           }
-//         }
-//       }));
+//       geminiWs.send(
+//         JSON.stringify({
+//           realtimeInput: {
+//             audio: {
+//               mimeType: "audio/pcm;rate=16000",
+//               data: msg.data,
+//             },
+//           },
+//         })
+//       );
 //       return;
 //     }
 
 //     // optional TEXT IN
 //     if (msg.type === "text") {
-//       geminiWs.send(JSON.stringify({
-//         realtimeInput: { text: msg.text || "" }
-//       }));
+//       geminiWs.send(
+//         JSON.stringify({
+//           realtimeInput: { text: msg.text || "" },
+//         })
+//       );
 //       return;
 //     }
 
 //     // STOP
 //     if (msg.type === "stop") {
-//       geminiWs.send(JSON.stringify({
-//         realtimeInput: { audioStreamEnd: true }
-//       }));
+//       geminiWs.send(
+//         JSON.stringify({
+//           realtimeInput: { audioStreamEnd: true },
+//         })
+//       );
 //       return;
 //     }
 //   });
@@ -198,7 +231,7 @@
 //   });
 // });
 
-const PORT = 8080;
-server.listen(PORT, () => {
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, "0.0.0.0", () => {
   console.log(`Praxis Voice Service listening on ${PORT}`);
 });
