@@ -1,8 +1,8 @@
-// /**
-//  * Cloud Run SERVICE entrypoint for voice.
-//  * - Uses your existing Praxis app from index.js
-//  * - Adds /ws/voice to bridge browser audio <-> Gemini Live
-//  */
+/**
+ * Cloud Run SERVICE entrypoint for voice.
+ * - Uses your existing Praxis app from index.js
+ * - Adds /ws/voice to bridge browser audio <-> Gemini Live
+ */
 
 // const http = require("http");
 // const WebSocket = require("ws");
@@ -198,7 +198,7 @@
 //   });
 // });
 
-// const PORT = process.env.PORT || 8080;
-// server.listen(PORT, () => {
-//   console.log(`Praxis Voice Service listening on ${PORT}`);
-// });
+const PORT = 8080;
+server.listen(PORT, () => {
+  console.log(`Praxis Voice Service listening on ${PORT}`);
+});
