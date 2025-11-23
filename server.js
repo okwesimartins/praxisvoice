@@ -1,9 +1,8 @@
 /**
- * server.js — Single-file Cloud Run VOICE service for Praxis
- * - WebSocket endpoint: /ws/voice
- * - Enforces student scope via Pluralcode API
- * - Optional LMS API key auth
- * - Bridges browser mic PCM16k <-> Gemini Live (audio + text)
+ * server.js — Single-file Praxis Voice on Cloud Run
+ * - Express health + serves a simple voice.html
+ * - WS /ws: browser audio <-> Gemini Live API
+ * - Enforces LMS key + student course scope
  */
 
 if (process.env.NODE_ENV !== "production") {
@@ -15,7 +14,6 @@ const express = require("express");
 const cors = require("cors");
 const WebSocket = require("ws");
 const crypto = require("crypto");
-const { GoogleGenerativeAI, HarmBlockThreshold, HarmCategory } = require("@google/generative-ai");
 const { google } = require("googleapis");
 
 // ---- fetch polyfill (Node < 18) ----
@@ -26,168 +24,319 @@ if (!fetchFn) {
 }
 const fetch = (...args) => fetchFn(...args);
 
-// ---------------- ENV ----------------
-const PORT = process.env.PORT || 8080;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const MY_LMS_API_KEY = process.env.MY_LMS_API_KEY; // optional but recommended
-
-const PLURALCODE_API_BASE =
-  process.env.PLURALCODE_API_URL || "https://backend.pluralcode.institute";
-
-const Google_Search_API_KEY = process.env.Google_Search_API_KEY;
-const Google_Search_CX_ID = process.env.Google_Search_CX_ID;
-
-// ---------------- EXPRESS ----------------
+// -----------------------------------------------------------------------------
+// EXPRESS APP (health + voice test page)
+// -----------------------------------------------------------------------------
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-app.get("/", (_, res) => res.status(200).send("ok"));
+app.get("/", (req, res) => res.type("text").send("ok"));
 
-// Serve the test page directly from Cloud Run
-app.get("/voice.html", (_, res) => {
-  res.type("html").send(VOICE_HTML);
+app.get("/voice", (req, res) => {
+  res.setHeader("content-type", "text/html");
+  res.send(VOICE_HTML);
 });
 
-// ---------------- HELPERS ----------------
+// -----------------------------------------------------------------------------
+// Pluralcode scope enforcement (same as your API version, simplified)
+// -----------------------------------------------------------------------------
+const PLURALCODE_API_BASE =
+  process.env.PLURALCODE_API_URL || "https://backend.pluralcode.institute";
+
 const normalizeEmail = (e) => String(e || "").trim().toLowerCase();
 
-const withTimeout = async (promise, ms, msg = "Timed out") => {
-  const t = new Promise((_, rej) =>
-    setTimeout(() => rej(new Error(msg)), ms)
-  );
-  return Promise.race([promise, t]);
+// Synonyms (expanded)
+const addSynonyms = (phrase, bag) => {
+  const raw = String(phrase || "");
+  const display = raw.trim();
+  const p = display.toLowerCase();
+  if (!display) return bag;
+  bag.add(display);
+
+  if (/javascript/.test(p)) {
+    bag.add("javascript");
+    bag.add("js");
+  }
+
+  if (/python/.test(p) || /data\s*analytics?/.test(p)) {
+    [
+      "python",
+      "numpy",
+      "pandas",
+      "matplotlib",
+      "seaborn",
+      "scikit-learn",
+      "jupyter",
+      "anaconda",
+      "etl",
+      "data wrangling",
+    ].forEach((x) => bag.add(x));
+  }
+  if (/\bsql\b/.test(p)) bag.add("sql");
+  if (/excel/.test(p)) bag.add("excel");
+  if (/power\s*bi|powerbi|pbi/.test(p)) {
+    bag.add("power bi");
+    bag.add("pbi");
+    bag.add("powerbi");
+  }
+  if (/machine\s*learning/.test(p)) {
+    bag.add("ml");
+    bag.add("machine learning");
+  }
+  if (/web\s*scraping/.test(p)) bag.add("web scraping");
+  if (/dax/.test(p)) bag.add("dax");
+
+  if (/\bscrum\b|agile/.test(p)) {
+    "scrum,agile,scrum events,scrum ceremonies,agile ceremonies,sprint planning,daily scrum,daily standup,sprint review,sprint retrospective,backlog refinement,product backlog refinement"
+      .split(",")
+      .forEach((x) => bag.add(x));
+  }
+  if (/kanban/.test(p)) bag.add("kanban");
+
+  return bag;
 };
 
-// ---------------- PLURALCODE SCOPE ----------------
-// (kept simpler than your big harvest logic, but same idea)
-async function getStudentScope(email) {
-  const clean = normalizeEmail(email);
-  if (!clean) throw new Error("Student email missing.");
-
-  const url = `${PLURALCODE_API_BASE}/student/praxis_get_student_courses?email=${encodeURIComponent(clean)}`;
-
-  const r = await withTimeout(fetch(url), 8000, "Pluralcode API timeout");
-  if (!r.ok) throw new Error("Could not verify student enrollment.");
-
-  const data = await r.json();
-  const enrolled = Array.isArray(data.enrolled_courses) ? data.enrolled_courses : [];
-
-  const courseNames = enrolled
-    .map((c) => (c.coursename || c.course_name || c.name || c.title || "").trim())
-    .filter(Boolean);
-
-  if (!courseNames.length) throw new Error("No active course enrollment found.");
-
-  // You can swap this for your full synonym/harvest logic later.
-  const allowedPhrases = new Set(courseNames.map((x) => x.toLowerCase()));
-  return { courseNames, allowedPhrases: Array.from(allowedPhrases) };
+const TOPIC_STRING_KEYS = new Set([
+  "coursename",
+  "course",
+  "course_name",
+  "name",
+  "title",
+  "topic",
+  "topic_name",
+  "label",
+  "module",
+  "module_name",
+  "lesson",
+  "lesson_name",
+  "chapter",
+  "section",
+  "unit",
+]);
+function harvestCourseStrings(node, bag) {
+  if (!node) return;
+  if (Array.isArray(node)) {
+    for (const it of node) harvestCourseStrings(it, bag);
+    return;
+  }
+  if (typeof node === "object") {
+    for (const [k, v] of Object.entries(node)) {
+      const key = String(k).toLowerCase();
+      if (typeof v === "string") {
+        if (TOPIC_STRING_KEYS.has(key)) {
+          const s = v.trim();
+          if (s && !/^https?:\/\//i.test(s) && s.length <= 200)
+            addSynonyms(s, bag);
+        }
+      } else if (Array.isArray(v)) {
+        for (const child of v) harvestCourseStrings(child, bag);
+      } else if (typeof v === "object" && v) harvestCourseStrings(v, bag);
+    }
+  }
 }
 
-function buildContextHeader(studentEmail, enrolledCourseNames, allowedPhrases, resolvedTopic) {
-  const sample = (allowedPhrases || []).slice(0, 60).join(" • ");
+const buildAllowedFromPayload = (data) => {
+  const phrases = new Set();
+  const courseNames = [];
+
+  const enrolled = Array.isArray(data.enrolled_courses)
+    ? data.enrolled_courses
+    : [];
+  for (const c of enrolled) {
+    const courseName = (
+      c.coursename ||
+      c.course_name ||
+      c.name ||
+      c.title ||
+      ""
+    ).trim();
+    if (courseName) {
+      courseNames.push(courseName);
+      addSynonyms(courseName, phrases);
+    }
+    if (c.course_topics) harvestCourseStrings(c.course_topics, phrases);
+    else harvestCourseStrings(c, phrases);
+  }
+
+  const sandbox = Array.isArray(data.sandbox) ? data.sandbox : [];
+  for (const s of sandbox) harvestCourseStrings(s, phrases);
+
+  return { courseNames, allowedPhrases: Array.from(phrases) };
+};
+
+const withTimeout = async (promise, ms, msg = "Timed out") => {
+  const timeout = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error(msg)), ms)
+  );
+  return Promise.race([promise, timeout]);
+};
+
+async function getStudentScope(email) {
+  const clean = normalizeEmail(email);
+  if (!clean) throw new Error("Student email is missing.");
+
+  const url = `${PLURALCODE_API_BASE}/student/praxis_get_student_courses?email=${encodeURIComponent(
+    clean
+  )}`;
+
+  const response = await withTimeout(fetch(url), 8000, "Pluralcode API timeout");
+  if (!response.ok)
+    throw new Error(`Pluralcode API failed with status ${response.status}`);
+  const data = await response.json();
+  const scope = buildAllowedFromPayload(data);
+
+  if (!scope.courseNames.length)
+    throw new Error("No active course enrollment found.");
+  return scope;
+}
+
+const summarizeAllowed = (arr, n = 80) => {
+  if (!Array.isArray(arr) || !arr.length) return "(none)";
+  const head = arr.slice(0, n).join(" • ");
+  return head + (arr.length > n ? ` • (+${arr.length - n} more)` : "");
+};
+
+function buildContextHeader(studentEmail, enrolledCourseNames, allowedPhrases) {
+  const sample = summarizeAllowed(allowedPhrases, 80);
   return `[CONTEXT]
 Student Email: ${studentEmail}
 Enrolled Course(s): "${enrolledCourseNames}"
-[ALLOWED TOPICS SAMPLE]: ${sample || "(none)"}
-[RESOLVED TOPIC]: ${resolvedTopic}
-[POLICY] Answer ONLY if within curriculum/sandbox. If out of scope, say so briefly and suggest 2–3 in-scope alternatives.`;
+[ALLOWED TOPICS SAMPLE] (truncated): ${sample}
+[POLICY] Answer ONLY if the topic is within the student's curriculum/sandbox. If out of scope, briefly say it's outside their program and offer 2–3 in-scope alternatives.`;
 }
 
-// ---------------- SEARCH TOOLS ----------------
-const youtube = google.youtube({ version: "v3", auth: Google_Search_API_KEY });
+// -----------------------------------------------------------------------------
+// Google search tools (same behavior as your old code)
+// -----------------------------------------------------------------------------
+const Google_Search_API_KEY = process.env.Google_Search_API_KEY;
+const Google_Search_CX_ID = process.env.Google_Search_CX_ID;
+
+const youtube = google.youtube({
+  version: "v3",
+  auth: Google_Search_API_KEY,
+});
+
+const isLikelyGoodUrl = (url) => {
+  if (!/^https?:\/\//i.test(url)) return false;
+  if (
+    /webcache\.googleusercontent\.com|translate\.googleusercontent\.com|accounts\.google\.com/i.test(
+      url
+    )
+  )
+    return false;
+  return true;
+};
+
+const validateUrl = async (url) => {
+  if (url.includes("pluralcode.academy") || url.includes("drive.google.com"))
+    return true;
+  if (!isLikelyGoodUrl(url)) return false;
+  try {
+    const res = await withTimeout(fetch(url, { method: "HEAD" }), 3500);
+    if (res.ok || (res.status >= 300 && res.status < 400)) return true;
+  } catch (_) {}
+  return false;
+};
+
+const cleanAndValidateResults = async (items, max = 3) => {
+  const pruned = [];
+  for (const item of items || []) {
+    if (!item?.link) continue;
+    if (!isLikelyGoodUrl(item.link)) continue;
+    if (await validateUrl(item.link)) pruned.push(item);
+    if (pruned.length >= max) break;
+  }
+  return pruned;
+};
 
 async function search_youtube_for_videos({ query }) {
-  try {
-    if (!Google_Search_API_KEY) return { error: "YouTube key missing." };
+  const response = await withTimeout(
+    youtube.search.list({
+      part: "snippet",
+      q: query,
+      type: "video",
+      videoEmbeddable: "true",
+      maxResults: 6,
+    }),
+    6000,
+    "YouTube search timeout"
+  );
 
-    const response = await withTimeout(
-      youtube.search.list({
-        part: "snippet",
-        q: query,
-        type: "video",
-        videoEmbeddable: "true",
-        maxResults: 5,
-      }),
-      6000,
-      "YouTube search timeout"
-    );
+  const items = (response.data.items || []).map((it) => ({
+    title: it.snippet.title,
+    link: `https://www.youtube.com/watch?v=${it.id.videoId}`,
+    snippet: it.snippet.description,
+  }));
 
-    const items = (response.data.items || []).map((it) => ({
-      title: it.snippet.title,
-      link: `https://www.youtube.com/watch?v=${it.id.videoId}`,
-      snippet: it.snippet.description,
-    }));
-
-    return items.length
-      ? { searchResults: items.slice(0, 3) }
-      : { message: `No YouTube videos found for "${query}".` };
-  } catch (e) {
-    return { error: "Failed to search YouTube.", details: e.message };
-  }
+  const valid = await cleanAndValidateResults(items, 3);
+  return valid.length
+    ? { searchResults: valid }
+    : { message: `No YouTube videos found for "${query}".` };
 }
 
 async function search_web_for_articles({ query }) {
-  try {
-    if (!Google_Search_API_KEY || !Google_Search_CX_ID) {
-      return { error: "Google Search env vars missing." };
-    }
+  const url = `https://www.googleapis.com/customsearch/v1?key=${Google_Search_API_KEY}&cx=${Google_Search_CX_ID}&q=${encodeURIComponent(
+    query
+  )}`;
+  const res = await withTimeout(fetch(url), 6000, "Web search timeout");
+  if (!res.ok)
+    throw new Error(`Google Search API responded with status ${res.status}`);
+  const data = await res.json();
 
-    const url =
-      `https://www.googleapis.com/customsearch/v1` +
-      `?key=${Google_Search_API_KEY}` +
-      `&cx=${Google_Search_CX_ID}` +
-      `&q=${encodeURIComponent(query)}`;
+  const items = (data.items || []).map((i) => ({
+    title: i.title,
+    link: i.link,
+    snippet: i.snippet,
+  }));
 
-    const r = await withTimeout(fetch(url), 6000, "Web search timeout");
-    if (!r.ok) throw new Error(`Search API status ${r.status}`);
-
-    const data = await r.json();
-    const items = (data.items || []).map((i) => ({
-      title: i.title,
-      link: i.link,
-      snippet: i.snippet,
-    }));
-
-    return items.length
-      ? { searchResults: items.slice(0, 3) }
-      : { message: `No articles found for "${query}".` };
-  } catch (e) {
-    return { error: "Failed to search web.", details: e.message };
-  }
+  const valid = await cleanAndValidateResults(items, 3);
+  return valid.length
+    ? { searchResults: valid }
+    : { message: `No articles found for "${query}".` };
 }
 
 const availableTools = { search_youtube_for_videos, search_web_for_articles };
 
-const toolDefs = [{
-  functionDeclarations: [
-    {
-      name: "search_web_for_articles",
-      description: "Search the web for high-quality articles and official docs.",
-      parameters: {
-        type: "OBJECT",
-        properties: {
-          query: { type: "STRING", description: "A detailed search query." },
+const toolDefs = [
+  {
+    functionDeclarations: [
+      {
+        name: "search_web_for_articles",
+        description:
+          "Search the web for high-quality articles, blog posts, and official documentation.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            query: {
+              type: "STRING",
+              description: "A detailed search query.",
+            },
+          },
+          required: ["query"],
         },
-        required: ["query"],
       },
-    },
-    {
-      name: "search_youtube_for_videos",
-      description: "Search YouTube for relevant tutorial videos.",
-      parameters: {
-        type: "OBJECT",
-        properties: {
-          query: { type: "STRING", description: "A detailed search query." },
+      {
+        name: "search_youtube_for_videos",
+        description: "Search YouTube for relevant tutorial videos.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            query: {
+              type: "STRING",
+              description: "A detailed search query.",
+            },
+          },
+          required: ["query"],
         },
-        required: ["query"],
       },
-    },
-  ],
-}];
+    ],
+  },
+];
 
-// ---------------- GEMINI LIVE ----------------
-// Live API WebSocket endpoint and message shapes are documented here. :contentReference[oaicite:1]{index=1}
+// -----------------------------------------------------------------------------
+// Gemini Live API bridge
+// -----------------------------------------------------------------------------
 const GEMINI_LIVE_WS =
   "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
@@ -195,12 +344,24 @@ const LIVE_MODEL =
   process.env.GEMINI_LIVE_MODEL ||
   "gemini-2.5-flash-native-audio-preview-09-2025";
 
-function openGeminiLiveSocket({ systemInstruction, tools }) {
-  if (!GEMINI_API_KEY) throw new Error("GEMINI_API_KEY missing in env.");
+const BASE_SYSTEM_INSTRUCTION = `
+You are Praxis, a specialized AI tutor for Pluralcode Academy.
 
-  const ws = new WebSocket(
-    `${GEMINI_LIVE_WS}?key=${encodeURIComponent(GEMINI_API_KEY)}`
-  );
+PLURALCODE KNOWLEDGE BASE (MANDATORY USAGE)
+- Official brand/site info: https://pluralcode.academy.
+- Course structure/modules/details must use official Pluralcode curriculum PDFs.
+CORE RULES
+1) Stay strictly within the student's enrolled course scope; sandbox topics are always allowed.
+2) If out of scope, say so briefly and offer 2–3 in-scope alternatives.
+3) Prefer authoritative sources when searching the web.
+Do NOT invent links.
+`;
+
+function openGeminiLiveSocket({ systemInstruction, tools }) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error("GEMINI_API_KEY missing in env.");
+
+  const ws = new WebSocket(`${GEMINI_LIVE_WS}?key=${encodeURIComponent(apiKey)}`);
 
   ws.on("open", () => {
     ws.send(
@@ -212,7 +373,10 @@ function openGeminiLiveSocket({ systemInstruction, tools }) {
             temperature: 0.4,
             maxOutputTokens: 512,
           },
-          systemInstruction, // string is valid per Live API config. :contentReference[oaicite:2]{index=2}
+          // IMPORTANT: Live API requires Content, not string. :contentReference[oaicite:1]{index=1}
+          systemInstruction: {
+            parts: [{ text: systemInstruction }],
+          },
           tools,
         },
       })
@@ -222,19 +386,11 @@ function openGeminiLiveSocket({ systemInstruction, tools }) {
   return ws;
 }
 
-// Base instruction (keep your full one if you want)
-const BASE_SYSTEM_INSTRUCTION = `
-You are Praxis, a specialized AI tutor for Pluralcode Academy.
-Follow the CONTEXT policy strictly.
-Do not answer out-of-scope topics.
-If asked out-of-scope, say so briefly and suggest 2–3 in-scope alternatives.
-`;
-
-// ---------------- HTTP + WS BRIDGE ----------------
+// -----------------------------------------------------------------------------
+// HTTP + WebSocket server
+// -----------------------------------------------------------------------------
 const server = http.createServer(app);
-
-// Browser connects here:
-const wss = new WebSocket.Server({ server, path: "/ws/voice" });
+const wss = new WebSocket.Server({ server, path: "/ws" });
 
 wss.on("connection", (clientWs) => {
   let geminiWs = null;
@@ -248,16 +404,18 @@ wss.on("connection", (clientWs) => {
 
   clientWs.on("message", async (raw) => {
     let msg;
-    try { msg = JSON.parse(raw.toString()); }
-    catch { return; }
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
 
-    // ----- START SESSION -----
     if (msg.type === "start") {
       try {
         sessionId = msg.sessionId || sessionId;
 
-        // LMS key auth (optional; if env set, enforce)
-        if (MY_LMS_API_KEY && msg.lmsKey !== MY_LMS_API_KEY) {
+        // LMS key check
+        if (msg.lmsKey && msg.lmsKey !== process.env.MY_LMS_API_KEY) {
           sendClient({ type: "error", error: "Unauthorized client" });
           clientWs.close();
           return;
@@ -265,19 +423,16 @@ wss.on("connection", (clientWs) => {
 
         const studentEmail = normalizeEmail(msg.student_email);
         const scope = await getStudentScope(studentEmail);
-
         const enrolledCourseNames = scope.courseNames.join(", ");
         const allowedPhrases = scope.allowedPhrases;
 
         const header = buildContextHeader(
           studentEmail,
           enrolledCourseNames,
-          allowedPhrases,
-          "(live voice session)"
+          allowedPhrases
         );
 
-        const systemInstruction =
-          `${BASE_SYSTEM_INSTRUCTION}\n\n${header}`;
+        const systemInstruction = `${BASE_SYSTEM_INSTRUCTION}\n\n${header}`;
 
         geminiWs = openGeminiLiveSocket({
           systemInstruction,
@@ -286,14 +441,16 @@ wss.on("connection", (clientWs) => {
 
         geminiWs.on("message", async (data) => {
           let gm;
-          try { gm = JSON.parse(data.toString()); }
-          catch { return; }
+          try {
+            gm = JSON.parse(data.toString());
+          } catch {
+            return;
+          }
 
           if (gm.setupComplete) {
             sendClient({ type: "ready", sessionId });
           }
 
-          // stream model parts
           const parts = gm?.serverContent?.modelTurn?.parts || [];
           for (const p of parts) {
             if (p.inlineData?.mimeType?.startsWith("audio/pcm")) {
@@ -304,17 +461,13 @@ wss.on("connection", (clientWs) => {
             }
           }
 
-          // tool calling from Live API. :contentReference[oaicite:3]{index=3}
+          // tool calling
           if (gm.toolCall?.functionCalls?.length) {
             const functionResponses = [];
             for (const fc of gm.toolCall.functionCalls) {
               const fn = availableTools[fc.name];
               if (!fn) continue;
-
-              let toolResult;
-              try { toolResult = await fn(fc.args || {}); }
-              catch (e) { toolResult = { error: e.message }; }
-
+              const toolResult = await fn(fc.args || {});
               functionResponses.push({
                 id: fc.id,
                 name: fc.name,
@@ -324,7 +477,6 @@ wss.on("connection", (clientWs) => {
                 },
               });
             }
-
             if (functionResponses.length) {
               geminiWs.send(
                 JSON.stringify({ toolResponse: { functionResponses } })
@@ -334,9 +486,6 @@ wss.on("connection", (clientWs) => {
 
           if (gm?.serverContent?.turnComplete) {
             sendClient({ type: "turnComplete" });
-          }
-          if (gm?.serverContent?.interrupted) {
-            sendClient({ type: "interrupted" });
           }
         });
 
@@ -349,7 +498,10 @@ wss.on("connection", (clientWs) => {
         });
 
         geminiWs.on("error", (e) => {
-          sendClient({ type: "error", error: e.message || "Gemini WS error" });
+          sendClient({
+            type: "error",
+            error: e.message || "Gemini WS error",
+          });
         });
       } catch (e) {
         sendClient({ type: "error", error: e.message });
@@ -359,14 +511,13 @@ wss.on("connection", (clientWs) => {
 
     if (!geminiWs || geminiWs.readyState !== WebSocket.OPEN) return;
 
-    // ----- AUDIO IN: PCM16k base64 -----
-    if (msg.type === "audio" && msg.data) {
+    if (msg.type === "audio") {
       geminiWs.send(
         JSON.stringify({
           realtimeInput: {
             audio: {
               mimeType: "audio/pcm;rate=16000",
-              data: msg.data,
+              data: msg.data, // base64 PCM16 mono 16k
             },
           },
         })
@@ -374,15 +525,19 @@ wss.on("connection", (clientWs) => {
       return;
     }
 
-    // ----- OPTIONAL TEXT IN -----
     if (msg.type === "text") {
-      geminiWs.send(JSON.stringify({ realtimeInput: { text: msg.text || "" } }));
+      geminiWs.send(
+        JSON.stringify({
+          realtimeInput: { text: msg.text || "" },
+        })
+      );
       return;
     }
 
-    // ----- STOP STREAM -----
     if (msg.type === "stop") {
-      geminiWs.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
+      geminiWs.send(
+        JSON.stringify({ realtimeInput: { audioStreamEnd: true } })
+      );
       return;
     }
   });
@@ -392,135 +547,160 @@ wss.on("connection", (clientWs) => {
   });
 });
 
-server.listen(PORT, "0.0.0.0", () => {
-  console.log(`Praxis Voice listening on ${PORT}`);
-});
+const PORT = process.env.PORT || 8080;
+server.listen(PORT, "0.0.0.0", () =>
+  console.log(`Praxis Voice listening on ${PORT}`)
+);
 
-// ---------------- INLINE TEST PAGE ----------------
-const VOICE_HTML = `<!doctype html>
+// -----------------------------------------------------------------------------
+// Simple voice test HTML (served at /voice)
+// -----------------------------------------------------------------------------
+const VOICE_HTML = `
+<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
   <title>Praxis Voice Test</title>
   <style>
-    body { font-family: system-ui, sans-serif; padding: 16px; max-width: 720px; margin: auto; }
-    input, button { padding: 8px; margin: 4px; }
-    #log { white-space: pre-wrap; background: #111; color: #0f0; padding: 10px; height: 160px; overflow: auto; }
-    #transcript { white-space: pre-wrap; border: 1px solid #ccc; padding: 10px; min-height: 140px; }
+    body { font-family: system-ui, sans-serif; max-width: 760px; margin: 24px auto; }
+    input, button { padding: 8px; font-size: 14px; }
+    #log { white-space: pre-wrap; background: #111; color: #0f0; padding: 12px; height: 280px; overflow: auto; border-radius: 8px; }
+    .row { display:flex; gap:8px; margin-bottom:8px; align-items:center; }
   </style>
 </head>
 <body>
-  <h2>Praxis Voice Test</h2>
+  <h2>Praxis Voice Live (WebSocket)</h2>
 
-  <div>
-    <input id="email" placeholder="student_email" size="35" />
-    <input id="lmsKey" placeholder="lmsKey (if needed)" size="25" />
-    <button id="connectBtn">Connect</button>
-    <button id="startBtn" disabled>Start Mic</button>
-    <button id="stopBtn" disabled>Stop Mic</button>
+  <div class="row">
+    <label>Email:</label>
+    <input id="email" placeholder="student@email.com" style="flex:1" />
+  </div>
+  <div class="row">
+    <label>LMS Key (optional):</label>
+    <input id="lmsKey" placeholder="MY_LMS_API_KEY" style="flex:1" />
   </div>
 
-  <h3>Status</h3>
-  <div id="log"></div>
+  <div class="row">
+    <button id="startBtn">Start</button>
+    <button id="stopBtn" disabled>Stop</button>
+  </div>
 
-  <h3>Transcript</h3>
-  <div id="transcript"></div>
+  <h3>Log</h3>
+  <div id="log"></div>
 
 <script>
 (() => {
-  const logEl = document.getElementById("log");
-  const transEl = document.getElementById("transcript");
-  const connectBtn = document.getElementById("connectBtn");
-  const startBtn = document.getElementById("startBtn");
-  const stopBtn = document.getElementById("stopBtn");
-  const emailEl = document.getElementById("email");
-  const lmsKeyEl = document.getElementById("lmsKey");
+  const logEl = document.getElementById('log');
+  const startBtn = document.getElementById('startBtn');
+  const stopBtn  = document.getElementById('stopBtn');
+  const emailEl  = document.getElementById('email');
+  const lmsKeyEl = document.getElementById('lmsKey');
 
-  let ws;
-  let audioCtx;
-  let micStream;
-  let processor;
-  let playingQueue = Promise.resolve();
+  let ws, audioCtx, micStream, processor;
+  let playTime = 0;
 
-  function log(s) {
-    logEl.textContent += s + "\\n";
+  const log = (...args) => {
+    logEl.textContent += args.join(' ') + "\\n";
     logEl.scrollTop = logEl.scrollHeight;
-  }
-  function addText(s) {
-    transEl.textContent += s + "\\n";
-    transEl.scrollTop = transEl.scrollHeight;
+  };
+
+  function base64FromArrayBuffer(ab) {
+    let binary = '';
+    const bytes = new Uint8Array(ab);
+    for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
   }
 
-  // Float32 -> Int16 PCM
+  function arrayBufferFromBase64(b64) {
+    const binary = atob(b64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return bytes.buffer;
+  }
+
   function floatTo16BitPCM(float32) {
     const out = new Int16Array(float32.length);
     for (let i = 0; i < float32.length; i++) {
       let s = Math.max(-1, Math.min(1, float32[i]));
-      out[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+      out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
     }
     return out;
   }
 
-  // Resample to 16k (very small linear resampler)
-  function resampleTo16k(input, inRate) {
-    if (inRate === 16000) return input;
-    const ratio = inRate / 16000;
-    const newLen = Math.round(input.length / ratio);
-    const out = new Float32Array(newLen);
+  // crude downsample to 16k mono
+  function downsampleBuffer(buffer, sampleRate, outRate = 16000) {
+    if (outRate === sampleRate) return buffer;
+    const ratio = sampleRate / outRate;
+    const newLen = Math.round(buffer.length / ratio);
+    const result = new Float32Array(newLen);
+    let offset = 0;
     for (let i = 0; i < newLen; i++) {
-      const pos = i * ratio;
-      const i0 = Math.floor(pos);
-      const i1 = Math.min(i0 + 1, input.length - 1);
-      const frac = pos - i0;
-      out[i] = input[i0] * (1 - frac) + input[i1] * frac;
+      const nextOffset = Math.round((i + 1) * ratio);
+      let sum = 0, count = 0;
+      for (let j = offset; j < nextOffset && j < buffer.length; j++) {
+        sum += buffer[j]; count++;
+      }
+      result[i] = sum / count;
+      offset = nextOffset;
     }
-    return out;
+    return result;
   }
 
-  function base64FromInt16(int16) {
-    const u8 = new Uint8Array(int16.buffer);
-    let binary = "";
-    for (let i = 0; i < u8.length; i++) binary += String.fromCharCode(u8[i]);
-    return btoa(binary);
+  async function startMic() {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    const source = audioCtx.createMediaStreamSource(micStream);
+
+    processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    source.connect(processor);
+    processor.connect(audioCtx.destination);
+
+    processor.onaudioprocess = (e) => {
+      if (!ws || ws.readyState !== 1) return;
+      const input = e.inputBuffer.getChannelData(0);
+      const down = downsampleBuffer(input, audioCtx.sampleRate, 16000);
+      const pcm16 = floatTo16BitPCM(down);
+      ws.send(JSON.stringify({ type: "audio", data: base64FromArrayBuffer(pcm16.buffer) }));
+    };
   }
 
-  function int16FromBase64(b64) {
-    const bin = atob(b64);
-    const u8 = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
-    return new Int16Array(u8.buffer);
+  function stopMic() {
+    if (processor) processor.disconnect();
+    if (micStream) micStream.getTracks().forEach(t => t.stop());
+    if (audioCtx) audioCtx.close();
+    processor = micStream = audioCtx = null;
   }
 
-  async function playPCM16k(b64) {
-    if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+  function playPcm16(base64Pcm) {
+    const ab = arrayBufferFromBase64(base64Pcm);
+    const pcm16 = new Int16Array(ab);
+    const float32 = new Float32Array(pcm16.length);
+    for (let i = 0; i < pcm16.length; i++) float32[i] = pcm16[i] / 0x8000;
 
-    const int16 = int16FromBase64(b64);
-    const f32 = new Float32Array(int16.length);
-    for (let i = 0; i < int16.length; i++) f32[i] = int16[i] / 32768;
-
-    const buffer = audioCtx.createBuffer(1, f32.length, 16000);
-    buffer.getChannelData(0).set(f32);
+    const buf = audioCtx.createBuffer(1, float32.length, 16000);
+    buf.copyToChannel(float32, 0);
 
     const src = audioCtx.createBufferSource();
-    src.buffer = buffer;
+    src.buffer = buf;
     src.connect(audioCtx.destination);
 
-    // queue to avoid overlap pops
-    playingQueue = playingQueue.then(() => new Promise((resolve) => {
-      src.onended = resolve;
-      src.start();
-    }));
+    const now = audioCtx.currentTime;
+    if (playTime < now) playTime = now;
+    src.start(playTime);
+    playTime += buf.duration;
   }
 
-  connectBtn.onclick = () => {
-    const wsUrl = location.origin.replace("https://","wss://").replace("http://","ws://") + "/ws/voice";
-    ws = new WebSocket(wsUrl);
+  startBtn.onclick = async () => {
+    const email = emailEl.value.trim();
+    if (!email) return log("Enter student email first.");
+
+    ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
 
     ws.onopen = () => {
-      log("WS open: " + wsUrl);
+      log("WS open.");
       ws.send(JSON.stringify({
-        type: "start",
-        student_email: emailEl.value.trim(),
+        type:"start",
+        student_email: email,
         lmsKey: lmsKeyEl.value.trim() || undefined
       }));
     };
@@ -529,60 +709,42 @@ const VOICE_HTML = `<!doctype html>
       const msg = JSON.parse(e.data);
 
       if (msg.type === "ready") {
-        log("Gemini ready. sessionId=" + msg.sessionId);
-        startBtn.disabled = false;
+        log("Gemini ready. Starting mic...");
+        startBtn.disabled = true;
         stopBtn.disabled = false;
+        await startMic();
       }
 
-      if (msg.type === "text") addText("AI: " + msg.text);
+      if (msg.type === "text") {
+        log("AI:", msg.text);
+      }
 
       if (msg.type === "audio") {
-        await playPCM16k(msg.data);
-      }
-
-      if (msg.type === "turnComplete") {
-        log("Turn complete.");
+        if (!audioCtx) return;
+        playPcm16(msg.data);
       }
 
       if (msg.type === "error") {
-        log("ERROR: " + msg.error);
+        log("ERROR:", msg.error);
       }
     };
 
-    ws.onerror = (e) => log("WS error");
-    ws.onclose = () => log("WS closed");
-  };
-
-  startBtn.onclick = async () => {
-    if (!ws || ws.readyState !== 1) return;
-
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-    const source = audioCtx.createMediaStreamSource(micStream);
-    processor = audioCtx.createScriptProcessor(4096, 1, 1);
-
-    processor.onaudioprocess = (event) => {
-      const input = event.inputBuffer.getChannelData(0);
-      const resampled = resampleTo16k(input, audioCtx.sampleRate);
-      const pcm16 = floatTo16BitPCM(resampled);
-      const b64 = base64FromInt16(pcm16);
-
-      ws.send(JSON.stringify({ type: "audio", data: b64 }));
+    ws.onclose = () => {
+      log("WS closed.");
+      stopMic();
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
     };
-
-    source.connect(processor);
-    processor.connect(audioCtx.destination);
-    log("Mic streaming...");
   };
 
   stopBtn.onclick = () => {
-    if (processor) processor.disconnect();
-    if (micStream) micStream.getTracks().forEach(t => t.stop());
-    if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "stop" }));
-    log("Mic stopped.");
+    if (ws && ws.readyState === 1) {
+      ws.send(JSON.stringify({ type:"stop" }));
+      ws.close();
+    }
   };
 })();
 </script>
 </body>
-</html>`;
+</html>
+`;
