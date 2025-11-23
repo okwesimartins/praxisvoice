@@ -307,20 +307,34 @@ function openGeminiLiveSocket({ systemInstruction, tools }) {
   const ws = new WebSocket(`${GEMINI_LIVE_WS}?key=${encodeURIComponent(apiKey)}`);
 
   ws.on("open", () => {
-    ws.send(JSON.stringify({
+    const setupPayload = {
       setup: {
         model: LIVE_MODEL,
         generationConfig: {
-          // If you get 1007 again, switch to ["AUDIO"] only.
-          responseModalities: ["AUDIO", "TEXT"],
+          responseModalities: ["AUDIO"], // ✅ FIXED: Audio only
           temperature: 0.4,
           maxOutputTokens: 512,
+          speechConfig: { // ✅ ADDED: Required for audio output
+            voiceConfig: {
+              prebuiltVoiceConfig: {
+                voiceName: "Aoede" // Options: Aoede, Puck, Charon, Kore, Fenrir
+              }
+            }
+          }
         },
-        // Keep Content form (works for WS)
-        systemInstruction: { parts: [{ text: systemInstruction }] },
-        tools,
-      },
-    }));
+        systemInstruction: {
+          parts: [{ text: systemInstruction }]
+        }
+      }
+    };
+
+    // Only add tools if they exist and are properly formatted
+    if (tools && Array.isArray(tools) && tools.length > 0 && tools[0].functionDeclarations?.length > 0) {
+      setupPayload.setup.tools = tools;
+    }
+
+    console.log("📤 Sending Gemini setup:", JSON.stringify(setupPayload, null, 2));
+    ws.send(JSON.stringify(setupPayload));
   });
 
   return ws;
@@ -378,6 +392,7 @@ wss.on("connection", (clientWs) => {
           try { gm = JSON.parse(data.toString()); } catch { return; }
 
           if (gm.setupComplete) {
+            console.log("✅ Gemini setup complete");
             sendClient({ type: "ready", sessionId });
           }
 
@@ -393,6 +408,7 @@ wss.on("connection", (clientWs) => {
 
           // tool calling
           if (gm.toolCall?.functionCalls?.length) {
+            console.log("🔧 Tool calls:", gm.toolCall.functionCalls.map(fc => fc.name));
             const functionResponses = [];
             for (const fc of gm.toolCall.functionCalls) {
               const fn = availableTools[fc.name];
@@ -418,6 +434,7 @@ wss.on("connection", (clientWs) => {
         });
 
         geminiWs.on("close", (code, reason) => {
+          console.error("❌ Gemini WS closed:", code, reason?.toString() || "");
           sendClient({
             type: "error",
             error: `Gemini WS closed: ${code} ${reason || ""}`,
@@ -426,10 +443,12 @@ wss.on("connection", (clientWs) => {
         });
 
         geminiWs.on("error", (e) => {
+          console.error("❌ Gemini WS error:", e);
           sendClient({ type: "error", error: e.message || "Gemini WS error" });
         });
 
       } catch (e) {
+        console.error("❌ Start error:", e);
         sendClient({ type: "error", error: e.message });
       }
       return;
@@ -471,7 +490,7 @@ wss.on("connection", (clientWs) => {
 
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, "0.0.0.0", () =>
-  console.log(`Praxis Voice listening on ${PORT}, model=${LIVE_MODEL}`)
+  console.log(`🚀 Praxis Voice listening on ${PORT}, model=${LIVE_MODEL}`)
 );
 
 // -----------------------------------------------------------------------------
