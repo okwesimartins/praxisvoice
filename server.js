@@ -618,6 +618,11 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    if (msg.type === "ping") {
+    ws.send(JSON.stringify({ type: "pong" }));
+    return;
+  }
+
     // ----- START SESSION -----
     if (msg.type === "start") {
       try {

@@ -16,19 +16,20 @@ const speakingIndicator = document.getElementById("speakingIndicator");
 
 const resourcesEl = document.getElementById("resources");
 const quizArea = document.getElementById("quizContainer");
-const quizScoreEl = document.getElementById("quizScore"); // may be null; always guard
+const quizScoreEl = document.getElementById("quizScore");
 
 // ================= STATE =================
 
 let ws = null;
 let wsReady = false;
+let heartbeatInterval = null;   // <--- NEW: client heartbeat
 
 let recognition = null;
-let sttActive = false;          // browser recognition currently running
-let talkSessionActive = false;  // user pressed Talk and we are waiting/listening
-let hasHeardSpeech = false;     // did we get any speech this talk session?
-let speechBuffer = "";          // accumulate all final segments
-let silenceTimer = null;        // timer to detect “done talking”
+let sttActive = false;
+let talkSessionActive = false;
+let hasHeardSpeech = false;
+let speechBuffer = "";
+let silenceTimer = null;
 
 let currentAudio = null;
 let conversationHistory = [];
@@ -40,8 +41,8 @@ let quizCorrect = 0;
 let quizTotal = 0;
 
 // WS reconnect state
-let sessionActive = false;      // logical “session is on” (user clicked Start, not Stop)
-let manualClose = false;        // true if WE closed the ws on purpose
+let sessionActive = false;
+let manualClose = false;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 5;
 let activeEmail = "";
@@ -114,7 +115,6 @@ function renderYoutubePreview(url) {
   const videoId = getYouTubeIdFromUrl(url);
   if (!videoId) return;
 
-  // remove placeholder on first resource
   const ph = resourcesEl.querySelector(".placeholder");
   if (ph) ph.remove();
 
@@ -175,7 +175,6 @@ function updateQuizScoreDisplay() {
 function renderQuiz(quiz) {
   if (!quizArea) return;
 
-  // remove placeholder
   const ph = quizArea.querySelector(".placeholder");
   if (ph) ph.remove();
 
@@ -310,16 +309,13 @@ function clearSilenceTimer() {
   }
 }
 
-// restart silence timer every time we get more speech
 function resetSilenceTimer() {
   clearSilenceTimer();
   if (!talkSessionActive || !sttActive || !hasHeardSpeech) return;
-
-  // If no more speech for ~2.5s after last final result -> stop listening & reply
   silenceTimer = setTimeout(() => {
     if (talkSessionActive && sttActive && hasHeardSpeech && recognition) {
       try {
-        recognition.stop(); // triggers onend which finalizes utterance
+        recognition.stop();
       } catch (e) {
         console.error("recognition.stop() in silenceTimer failed:", e);
       }
@@ -366,7 +362,6 @@ function initSTT() {
         speechBuffer = text;
       }
 
-      // user is still talking → reset silence timer
       resetSilenceTimer();
     }
   };
@@ -375,11 +370,9 @@ function initSTT() {
     console.error("STT error:", event);
 
     if (event.error === "no-speech" && talkSessionActive && !hasHeardSpeech) {
-      // user hasn't spoken yet; let onend restart
       return;
     }
 
-    // Other errors → end talk session
     talkSessionActive = false;
     hasHeardSpeech = false;
     sttActive = false;
@@ -394,7 +387,6 @@ function initSTT() {
   rec.onend = () => {
     sttActive = false;
 
-    // If user manually cancelled (Talk toggled OFF)
     if (!talkSessionActive) {
       clearSilenceTimer();
       speechBuffer = "";
@@ -404,7 +396,6 @@ function initSTT() {
       return;
     }
 
-    // Still waiting for user to talk → restart
     if (talkSessionActive && !hasHeardSpeech) {
       setTimeout(() => {
         if (talkSessionActive && !sttActive) {
@@ -421,7 +412,6 @@ function initSTT() {
       return;
     }
 
-    // talkSessionActive && hasHeardSpeech → we stopped because of silence
     talkSessionActive = false;
     clearSilenceTimer();
     talkBtn.classList.remove("listening");
@@ -512,17 +502,20 @@ function handleUserUtterance(transcript) {
   addTranscriptLine("user", transcript);
   conversationHistory.push({ role: "user", text: transcript });
 
-  // manual barge-in: stop any current Praxis audio
   stopCurrentAudio();
 
   sendUserTextOverWS(transcript);
 }
 
-// open / reopen WS connection
 function openWebSocket() {
   if (!activeEmail) {
     log("Cannot open WebSocket: missing activeEmail", true);
     return;
+  }
+
+  if (heartbeatInterval) {
+    clearInterval(heartbeatInterval);
+    heartbeatInterval = null;
   }
 
   ws = new WebSocket(WS_URL);
@@ -537,9 +530,18 @@ function openWebSocket() {
         type: "start",
         student_email: activeEmail,
         lmsKey: activeLmsKey || undefined,
-        history: conversationHistory, // seed context on reconnect
+        history: conversationHistory,
       })
     );
+
+    heartbeatInterval = setInterval(() => {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: "ping" }));
+      } else {
+        clearInterval(heartbeatInterval);
+        heartbeatInterval = null;
+      }
+    }, 20000);
   };
 
   ws.onmessage = (event) => {
@@ -548,6 +550,10 @@ function openWebSocket() {
       msg = JSON.parse(event.data);
     } catch (e) {
       console.error("WS parse error:", e);
+      return;
+    }
+
+    if (msg.type === "pong") {
       return;
     }
 
@@ -592,24 +598,31 @@ function openWebSocket() {
 
   ws.onclose = (event) => {
     wsReady = false;
-    stopCurrentAudio();
+
+    if (heartbeatInterval) {
+      clearInterval(heartbeatInterval);
+      heartbeatInterval = null;
+    }
+
     cancelTalkSession();
 
-    log("WebSocket closed.");
+    log(
+      `WebSocket closed (code=${event.code}, reason="${event.reason || ""}")`
+    );
 
-    // If session is still logically active and we didn't call close() ourselves,
-    // try to reconnect a few times.
     if (
       sessionActive &&
       !manualClose &&
       reconnectAttempts < MAX_RECONNECT_ATTEMPTS
     ) {
       reconnectAttempts += 1;
-      const delayMs = 1000 * Math.pow(2, reconnectAttempts - 1); // 1s,2s,4s,8s,16s
+      const delayMs = 1000 * Math.pow(2, reconnectAttempts - 1);
 
       log(
         `Connection lost. Attempting to reconnect in ${delayMs / 1000} seconds...`
       );
+
+      talkBtn.disabled = true;
 
       setTimeout(() => {
         if (sessionActive && !manualClose) {
@@ -619,7 +632,6 @@ function openWebSocket() {
       return;
     }
 
-    // Otherwise, fully reset UI
     emailInput.disabled = false;
     lmsKeyInput.disabled = false;
     startBtn.disabled = false;
@@ -683,6 +695,11 @@ function stopSession() {
   sessionActive = false;
   manualClose = true;
 
+  if (heartbeatInterval) {
+    clearInterval(heartbeatInterval);
+    heartbeatInterval = null;
+  }
+
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "stop" }));
     ws.close();
@@ -705,7 +722,6 @@ function handleTalkClick() {
     return;
   }
 
-  // if Praxis is speaking, interrupt first
   if (currentAudio) {
     stopCurrentAudio();
   }
