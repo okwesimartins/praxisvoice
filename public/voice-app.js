@@ -16,7 +16,7 @@ const speakingIndicator = document.getElementById("speakingIndicator");
 
 const resourcesEl = document.getElementById("resources");
 const quizArea = document.getElementById("quizContainer");
-const quizScoreEl = document.getElementById("quizScore"); // may be null; guarded
+const quizScoreEl = document.getElementById("quizScore"); // may be null; always guard
 
 // ================= STATE =================
 
@@ -25,19 +25,27 @@ let wsReady = false;
 
 let recognition = null;
 let sttActive = false;          // browser recognition currently running
-let talkSessionActive = false;  // "user pressed Talk and I'm waiting for their speech"
-let hasHeardSpeech = false;     // have we received any final transcript this talk session?
+let talkSessionActive = false;  // user pressed Talk and we are waiting/listening
+let hasHeardSpeech = false;     // did we get any speech this talk session?
 let speechBuffer = "";          // accumulate all final segments
-let silenceTimer = null;        // timer to detect "done talking"
+let silenceTimer = null;        // timer to detect “done talking”
 
 let currentAudio = null;
 let conversationHistory = [];
 
 let lastRequestId = null;
 
-// Quiz score
+// quiz score
 let quizCorrect = 0;
 let quizTotal = 0;
+
+// WS reconnect state
+let sessionActive = false;      // logical “session is on” (user clicked Start, not Stop)
+let manualClose = false;        // true if WE closed the ws on purpose
+let reconnectAttempts = 0;
+const MAX_RECONNECT_ATTEMPTS = 5;
+let activeEmail = "";
+let activeLmsKey = "";
 
 // ================= UTIL: LOGGING =================
 
@@ -54,9 +62,7 @@ function log(msg, isError = false) {
 // ================= UTIL: TRANSCRIPT UI =================
 
 function clearTranscriptIfPlaceholder() {
-  if (
-    transcriptEl.textContent.trim() === "Transcript will appear here..."
-  ) {
+  if (transcriptEl.textContent.trim() === "Transcript will appear here...") {
     transcriptEl.innerHTML = "";
   }
 }
@@ -79,7 +85,6 @@ function extractYoutubeLinks(text) {
   let match;
   while ((match = urlRegex.exec(text)) !== null) {
     let url = match[1];
-    // strip trailing punctuation
     url = url.replace(/[),.]+$/, "");
     if (url.includes("youtube.com/watch") || url.includes("youtu.be")) {
       links.push(url);
@@ -105,10 +110,11 @@ function getYouTubeIdFromUrl(url) {
 
 function renderYoutubePreview(url) {
   if (!resourcesEl) return;
+
   const videoId = getYouTubeIdFromUrl(url);
   if (!videoId) return;
 
-  // remove placeholder once we have first resource
+  // remove placeholder on first resource
   const ph = resourcesEl.querySelector(".placeholder");
   if (ph) ph.remove();
 
@@ -169,7 +175,7 @@ function updateQuizScoreDisplay() {
 function renderQuiz(quiz) {
   if (!quizArea) return;
 
-  // remove placeholder on first quiz
+  // remove placeholder
   const ph = quizArea.querySelector(".placeholder");
   if (ph) ph.remove();
 
@@ -309,16 +315,16 @@ function resetSilenceTimer() {
   clearSilenceTimer();
   if (!talkSessionActive || !sttActive || !hasHeardSpeech) return;
 
-  // If no more speech for 1.5s after last final result -> stop listening and reply
+  // If no more speech for ~2.5s after last final result -> stop listening & reply
   silenceTimer = setTimeout(() => {
     if (talkSessionActive && sttActive && hasHeardSpeech && recognition) {
       try {
-        recognition.stop(); // this will trigger onend, which finalizes the utterance
+        recognition.stop(); // triggers onend which finalizes utterance
       } catch (e) {
         console.error("recognition.stop() in silenceTimer failed:", e);
       }
     }
-  }, 1500);
+  }, 2500);
 }
 
 function initSTT() {
@@ -326,7 +332,7 @@ function initSTT() {
     window.SpeechRecognition || window.webkitSpeechRecognition;
   if (!SpeechRecognition) {
     log(
-      "Browser does not support SpeechRecognition (STT). Use Chrome-based browser.",
+      "Browser does not support SpeechRecognition (STT). Use a Chrome-based browser.",
       true
     );
     return null;
@@ -334,8 +340,8 @@ function initSTT() {
 
   const rec = new SpeechRecognition();
   rec.lang = "en-US";
-  rec.continuous = true;      // continuous stream
-  rec.interimResults = false; // only final results
+  rec.continuous = true;
+  rec.interimResults = false;
 
   rec.onstart = () => {
     sttActive = true;
@@ -345,7 +351,6 @@ function initSTT() {
   };
 
   rec.onresult = (event) => {
-    // accumulate all final chunks into one buffer
     for (let i = event.resultIndex; i < event.results.length; i++) {
       const result = event.results[i];
       if (!result.isFinal) continue;
@@ -354,13 +359,14 @@ function initSTT() {
       if (!text) continue;
 
       hasHeardSpeech = true;
+
       if (speechBuffer.length) {
         speechBuffer += " " + text;
       } else {
         speechBuffer = text;
       }
 
-      // user is still talking, so reset silence timer
+      // user is still talking → reset silence timer
       resetSilenceTimer();
     }
   };
@@ -368,13 +374,12 @@ function initSTT() {
   rec.onerror = (event) => {
     console.error("STT error:", event);
 
-    // If it's "no-speech" before we've heard anything, keep waiting for the user:
     if (event.error === "no-speech" && talkSessionActive && !hasHeardSpeech) {
-      // let onend handle the restart
+      // user hasn't spoken yet; let onend restart
       return;
     }
 
-    // Other errors: end talk session
+    // Other errors → end talk session
     talkSessionActive = false;
     hasHeardSpeech = false;
     sttActive = false;
@@ -389,7 +394,7 @@ function initSTT() {
   rec.onend = () => {
     sttActive = false;
 
-    // If user manually cancelled (Talk toggled OFF), do not do anything else.
+    // If user manually cancelled (Talk toggled OFF)
     if (!talkSessionActive) {
       clearSilenceTimer();
       speechBuffer = "";
@@ -399,8 +404,7 @@ function initSTT() {
       return;
     }
 
-    // If talk session is active but we haven't heard any speech yet,
-    // restart recognition so it keeps waiting until user starts talking.
+    // Still waiting for user to talk → restart
     if (talkSessionActive && !hasHeardSpeech) {
       setTimeout(() => {
         if (talkSessionActive && !sttActive) {
@@ -417,8 +421,7 @@ function initSTT() {
       return;
     }
 
-    // talkSessionActive && hasHeardSpeech == true
-    // -> recognition stopped due to silence timer; finalize utterance.
+    // talkSessionActive && hasHeardSpeech → we stopped because of silence
     talkSessionActive = false;
     clearSilenceTimer();
     talkBtn.classList.remove("listening");
@@ -443,7 +446,6 @@ function startTalkSession() {
     recognition = initSTT();
   }
   if (!recognition) return;
-
   if (sttActive) return;
 
   talkSessionActive = true;
@@ -510,63 +512,32 @@ function handleUserUtterance(transcript) {
   addTranscriptLine("user", transcript);
   conversationHistory.push({ role: "user", text: transcript });
 
-  // Once user talks, stop any current AI speech (manual barge-in)
+  // manual barge-in: stop any current Praxis audio
   stopCurrentAudio();
 
   sendUserTextOverWS(transcript);
 }
 
-// ================= SESSION CONTROL =================
-
-function startSession() {
-  const email = emailInput.value.trim();
-  if (!email) {
-    log("Please enter student email.", true);
+// open / reopen WS connection
+function openWebSocket() {
+  if (!activeEmail) {
+    log("Cannot open WebSocket: missing activeEmail", true);
     return;
   }
 
-  transcriptEl.textContent = "Transcript will appear here...";
-  logsEl.textContent = "";
-
-  if (resourcesEl) {
-    resourcesEl.innerHTML =
-      '<p class="placeholder">Links and YouTube previews will appear here when Praxis shares resources.</p>';
-  }
-  if (quizArea) {
-    quizArea.innerHTML =
-      '<p class="placeholder">No quiz yet. Ask Praxis to test you with a short quiz.</p>';
-  }
-  if (quizScoreEl) {
-    quizScoreEl.textContent = "No quizzes completed yet.";
-  }
-
-  quizCorrect = 0;
-  quizTotal = 0;
-  conversationHistory = [];
-  wsReady = false;
-  lastRequestId = null;
-
-  // reset STT state
-  cancelTalkSession();
-
-  emailInput.disabled = true;
-  lmsKeyInput.disabled = true;
-  startBtn.disabled = true;
-  stopBtn.disabled = false;
-  talkBtn.disabled = true;
-
-  const lmsKey = lmsKeyInput.value.trim() || undefined;
-
-  log("Connecting WebSocket...");
   ws = new WebSocket(WS_URL);
 
   ws.onopen = () => {
     log("WebSocket connected. Sending start...");
+    wsReady = true;
+    reconnectAttempts = 0;
+
     ws.send(
       JSON.stringify({
         type: "start",
-        student_email: email,
-        lmsKey,
+        student_email: activeEmail,
+        lmsKey: activeLmsKey || undefined,
+        history: conversationHistory, // seed context on reconnect
       })
     );
   };
@@ -619,14 +590,36 @@ function startSession() {
     log("WebSocket error.", true);
   };
 
-  ws.onclose = () => {
-    log("WebSocket closed.");
+  ws.onclose = (event) => {
     wsReady = false;
     stopCurrentAudio();
-
-    // Stop any listening session
     cancelTalkSession();
 
+    log("WebSocket closed.");
+
+    // If session is still logically active and we didn't call close() ourselves,
+    // try to reconnect a few times.
+    if (
+      sessionActive &&
+      !manualClose &&
+      reconnectAttempts < MAX_RECONNECT_ATTEMPTS
+    ) {
+      reconnectAttempts += 1;
+      const delayMs = 1000 * Math.pow(2, reconnectAttempts - 1); // 1s,2s,4s,8s,16s
+
+      log(
+        `Connection lost. Attempting to reconnect in ${delayMs / 1000} seconds...`
+      );
+
+      setTimeout(() => {
+        if (sessionActive && !manualClose) {
+          openWebSocket();
+        }
+      }, delayMs);
+      return;
+    }
+
+    // Otherwise, fully reset UI
     emailInput.disabled = false;
     lmsKeyInput.disabled = false;
     startBtn.disabled = false;
@@ -635,9 +628,60 @@ function startSession() {
   };
 }
 
+// ================= SESSION CONTROL =================
+
+function startSession() {
+  const email = emailInput.value.trim();
+  if (!email) {
+    log("Please enter student email.", true);
+    return;
+  }
+
+  activeEmail = email;
+  activeLmsKey = lmsKeyInput.value.trim() || "";
+  sessionActive = true;
+  manualClose = false;
+  reconnectAttempts = 0;
+
+  transcriptEl.textContent = "Transcript will appear here...";
+  logsEl.textContent = "";
+
+  if (resourcesEl) {
+    resourcesEl.innerHTML =
+      '<p class="placeholder">Links and YouTube previews will appear here when Praxis shares resources.</p>';
+  }
+  if (quizArea) {
+    quizArea.innerHTML =
+      '<p class="placeholder">No quiz yet. Ask Praxis to test you with a short quiz.</p>';
+  }
+  if (quizScoreEl) {
+    quizScoreEl.textContent = "No quizzes completed yet.";
+  }
+
+  quizCorrect = 0;
+  quizTotal = 0;
+  conversationHistory = [];
+  wsReady = false;
+  lastRequestId = null;
+
+  cancelTalkSession();
+
+  emailInput.disabled = true;
+  lmsKeyInput.disabled = true;
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  talkBtn.disabled = true;
+
+  log("Connecting WebSocket...");
+  openWebSocket();
+}
+
 function stopSession() {
   stopCurrentAudio();
   cancelTalkSession();
+
+  sessionActive = false;
+  manualClose = true;
 
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "stop" }));
@@ -661,7 +705,7 @@ function handleTalkClick() {
     return;
   }
 
-  // If AI is currently speaking, interrupt it first
+  // if Praxis is speaking, interrupt first
   if (currentAudio) {
     stopCurrentAudio();
   }

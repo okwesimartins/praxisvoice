@@ -2,7 +2,7 @@
  * server.js — Praxis Voice Backend (Gemini text + Google TTS + WebSocket)
  * - Express health + serves static frontend (public/voice-app.html)
  * - WS /ws: browser text <-> Gemini text API + Google Text-to-Speech
- * - Enforces LMS key + student course scope (similar logic to Slack index.js)
+ * - Enforces LMS key + student course scope (aligned with Slack index.js)
  */
 
 if (process.env.NODE_ENV !== "production") {
@@ -56,14 +56,13 @@ app.get("/voice", (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// Pluralcode scope enforcement (aligned with index.js logic)
+// Pluralcode scope enforcement (matching your Slack bot logic)
 // -----------------------------------------------------------------------------
 const PLURALCODE_API_BASE =
   process.env.PLURALCODE_API_URL || "https://backend.pluralcode.institute";
 
 const normalizeEmail = (e) => String(e || "").trim().toLowerCase();
 
-// --- timeouts helper ---
 const withTimeout = async (promise, ms, msg = "Timed out") => {
   const timeout = new Promise((_, reject) =>
     setTimeout(() => reject(new Error(msg)), ms)
@@ -71,21 +70,19 @@ const withTimeout = async (promise, ms, msg = "Timed out") => {
   return Promise.race([promise, timeout]);
 };
 
-// Synonyms like in index.js (Data Analytics -> Excel, NumPy, pandas, etc.)
+// Synonyms expanded like in index.js
 const addSynonyms = (phrase, bag) => {
   const raw = String(phrase || "");
   const display = raw.trim();
   const p = display.toLowerCase();
   if (!display) return bag;
-  bag.add(display); // keep original string as well
+  bag.add(display);
 
-  // General
   if (/javascript/.test(p)) {
     bag.add("javascript");
     bag.add("js");
   }
 
-  // Data / Python ecosystem
   if (/python/.test(p) || /data\s*analytics?/.test(p)) {
     [
       "python",
@@ -117,7 +114,6 @@ const addSynonyms = (phrase, bag) => {
   if (/web\s*scraping/.test(p)) bag.add("web scraping");
   if (/dax/.test(p)) bag.add("dax");
 
-  // Agile / Scrum
   if (/\bscrum\b|agile/.test(p)) {
     "scrum,agile,scrum events,scrum ceremonies,agile ceremonies,sprint planning,daily scrum,daily standup,sprint review,sprint retrospective,backlog refinement,product backlog refinement"
       .split(",")
@@ -128,7 +124,6 @@ const addSynonyms = (phrase, bag) => {
   return bag;
 };
 
-// Keys we consider as “topic strings” in the curriculum payload
 const TOPIC_STRING_KEYS = new Set([
   "coursename",
   "course",
@@ -147,7 +142,6 @@ const TOPIC_STRING_KEYS = new Set([
   "unit",
 ]);
 
-// Arrays of nested topics
 const TOPIC_ARRAY_KEYS = new Set([
   "course_topics",
   "topics",
@@ -257,14 +251,14 @@ Enrolled Course(s): "${enrolledCourseNames}"
 [POLICY]
 - You are Praxis, a calm, friendly MALE online tutor for Pluralcode Academy.
 - Focus on the student's enrolled course(s) and closely related tools and topics.
-- Tools and concepts that are standard for these courses (for example: Excel, Power BI, SQL, Python, NumPy, pandas, Jupyter, ETL, Scrum, Kanban, etc.) are considered IN SCOPE even if the exact word does not literally appear in the raw curriculum text.
-- Only say a topic is "outside their curriculum" if it is clearly unrelated to *all* enrolled courses (e.g. medicine for a Data Analytics student).
+- Standard tools for those courses (for example: Excel, Power BI, SQL, Python, NumPy, pandas, Jupyter, ETL, Scrum, Kanban, etc.) are considered IN SCOPE even if the exact word does not literally appear in the raw curriculum data.
+- Only say a topic is "outside their curriculum" if it is clearly unrelated to all enrolled courses.
 - If something is ambiguous but plausibly part of their course (like Excel for Data Analytics), treat it as in-scope and answer.
-- When recommending YouTube videos or articles, include full URLs in the text so the UI can show previews. Do not read the URLs aloud in detail; in voice, just mention that you are sharing a link.`;
+- When you recommend external resources, include full URLs in the text so the UI can show previews. In voice, do NOT spell out the URL; just refer to it naturally.`;
 }
 
 // -----------------------------------------------------------------------------
-// (Optional) Google search helpers (kept here if you want to wire tools later)
+// (Optional) Google search helpers — available if you later want tools
 // -----------------------------------------------------------------------------
 const Google_Search_API_KEY = process.env.Google_Search_API_KEY;
 const Google_Search_CX_ID = process.env.Google_Search_CX_ID;
@@ -404,8 +398,8 @@ LINKS & RESOURCES
 - In voice, do NOT read out the full URL; just say something like: "I'm sharing a YouTube link in your resources panel."
 
 SCOPE
-- You must follow the additional scope rules and allowed topics that will be provided in a [CONTEXT] block for each student.
-- If a request is clearly unrelated to their enrolled courses, briefly say so and suggest 2–3 in-scope alternatives instead.
+- You must also follow an extra [CONTEXT] block that describes the student's enrolled courses and allowed topics.
+- If a request is clearly unrelated to all enrolled courses, briefly say so and suggest 2–3 in-scope alternatives instead of trying to answer it.
 `;
 
 /**
@@ -455,7 +449,7 @@ async function callGeminiChat({ systemInstruction, contents }) {
 }
 
 // -----------------------------------------------------------------------------
-// GOOGLE TTS — sanitize + synthesize (no links or weird characters)
+// GOOGLE TTS — sanitize + synthesize (no URLs or weird characters)
 // -----------------------------------------------------------------------------
 
 function sanitizeForSpeech(text) {
@@ -485,14 +479,14 @@ function sanitizeForSpeech(text) {
   t = t.replace(/\bwww\.[^\s]+/gi, " ");
 
   // Remove inline code and markdown-ish symbols
-  t = t.replace(/`[^`]*`/g, " "); // code spans
-  t = t.replace(/[*_>#\-]+/g, " "); // bullets, markdown
-  t = t.replace(/[•~_=^]+/g, " "); // bullets and decorations
+  t = t.replace(/`[^`]*`/g, " ");
+  t = t.replace(/[*_>#\-]+/g, " ");
+  t = t.replace(/[•~_=^]+/g, " ");
 
-  // Remove brackets, slashes, pipes, etc.
+  // Remove brackets, slashes, pipes
   t = t.replace(/[\[\]\(\)\{\}<>\/\\|]+/g, " ");
 
-  // Squash multiple punctuation
+  // Collapse extra punctuation
   t = t.replace(/[;:]{2,}/g, " ");
 
   // Fix some pronunciations
@@ -517,7 +511,7 @@ async function synthesizeWithGoogleTTS(fullText) {
     },
     audioConfig: {
       audioEncoding: "MP3",
-      speakingRate: 0.95, // slightly slower for teaching
+      speakingRate: 0.95,
     },
   };
 
@@ -531,7 +525,7 @@ async function synthesizeWithGoogleTTS(fullText) {
 }
 
 // -----------------------------------------------------------------------------
-// Optional HTTP /api/chat for non-WS clients
+// Optional HTTP /api/chat (non-WS clients)
 // -----------------------------------------------------------------------------
 app.post("/api/chat", async (req, res) => {
   try {
@@ -602,7 +596,7 @@ wss.on("connection", (ws) => {
 
   console.log("WS client connected:", ws.id);
 
-  // --- Keep WebSocket alive with ping frames ---
+  // Keep WebSocket alive with periodic ping frames
   const pingInterval = setInterval(() => {
     if (ws.readyState === WebSocket.OPEN) {
       try {
@@ -647,11 +641,21 @@ wss.on("connection", (ws) => {
         );
         const systemInstruction = `${BASE_SYSTEM_INSTRUCTION}\n\n${header}`;
 
+        // seed history from client (for reconnect)
+        const initialHistory = Array.isArray(msg.history)
+          ? msg.history.filter(
+              (h) =>
+                h &&
+                typeof h.text === "string" &&
+                (h.role === "user" || h.role === "assistant")
+            )
+          : [];
+
         ws.session = {
           studentEmail,
           lmsKey: msg.lmsKey,
           systemInstruction,
-          history: [],
+          history: initialHistory,
         };
 
         ws.send(JSON.stringify({ type: "ready" }));
