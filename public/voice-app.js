@@ -22,7 +22,7 @@ const quizScoreEl = document.getElementById("quizScore");
 
 let ws = null;
 let wsReady = false;
-let heartbeatInterval = null;   // <--- NEW: client heartbeat
+let heartbeatInterval = null;   // client heartbeat
 
 let recognition = null;
 let sttActive = false;
@@ -31,7 +31,11 @@ let hasHeardSpeech = false;
 let speechBuffer = "";
 let silenceTimer = null;
 
-let currentAudio = null;
+// Web Audio (for iOS-safe TTS)
+let audioCtx = null;
+let currentAudioSource = null;
+let audioCtxReady = false;
+
 let conversationHistory = [];
 
 let lastRequestId = null;
@@ -255,48 +259,87 @@ function renderQuiz(quiz) {
   updateQuizScoreDisplay();
 }
 
-// ================= AUDIO PLAYBACK (Google TTS MP3) =================
+// ================= AUDIO: Web Audio API (iOS-friendly TTS) =================
+
+function ensureAudioContext() {
+  if (!audioCtx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) {
+      log(
+        "Web Audio API not supported; audio playback may not work on this device.",
+        true
+      );
+      return null;
+    }
+    audioCtx = new AC();
+  }
+
+  if (audioCtx.state === "suspended") {
+    audioCtx
+      .resume()
+      .then(() => {
+        audioCtxReady = true;
+        console.log("AudioContext resumed");
+      })
+      .catch((err) => {
+        console.error("AudioContext resume failed:", err);
+        log("Unable to resume audio context: " + err.message, true);
+      });
+  } else {
+    audioCtxReady = true;
+  }
+
+  return audioCtx;
+}
 
 function stopCurrentAudio() {
-  if (currentAudio) {
-    currentAudio.pause();
-    currentAudio.currentTime = 0;
-    currentAudio = null;
+  if (currentAudioSource) {
+    try {
+      currentAudioSource.stop();
+    } catch (_) {}
+    try {
+      currentAudioSource.disconnect();
+    } catch (_) {}
+    currentAudioSource = null;
   }
   speakingIndicator.classList.add("hidden");
 }
 
-function playAssistantAudio(base64Audio, mimeType) {
+async function playAssistantAudio(base64Audio, mimeType) {
   stopCurrentAudio();
   if (!base64Audio) return;
 
+  const ctx = ensureAudioContext();
+  if (!ctx) return;
+
   try {
-    const src = `data:${mimeType || "audio/mpeg"};base64,${base64Audio}`;
-    const audio = new Audio(src);
-    currentAudio = audio;
+    // Decode base64 → ArrayBuffer
+    const binary = atob(base64Audio);
+    const len = binary.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
 
-    audio.onplay = () => {
-      speakingIndicator.classList.remove("hidden");
+    const audioBuffer = await ctx.decodeAudioData(bytes.buffer);
+
+    const source = ctx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(ctx.destination);
+
+    source.onended = () => {
+      speakingIndicator.classList.add("hidden");
+      currentAudioSource = null;
     };
 
-    audio.onended = () => {
-      speakingIndicator.classList.add("hidden");
-      currentAudio = null;
-    };
-
-    audio.onerror = (e) => {
-      console.error("Audio playback error:", e);
-      speakingIndicator.classList.add("hidden");
-      currentAudio = null;
-    };
-
-    audio.play().catch((err) => {
-      console.error("Audio play() failed:", err);
-      speakingIndicator.classList.add("hidden");
-      currentAudio = null;
-    });
-  } catch (e) {
-    console.error("Failed to create audio element:", e);
+    speakingIndicator.classList.remove("hidden");
+    currentAudioSource = source;
+    source.start(0);
+  } catch (err) {
+    console.error("WebAudio playback failed:", err);
+    log("Audio playback failed: " + err.message, true);
+    speakingIndicator.classList.add("hidden");
+    currentAudioSource = null;
   }
 }
 
@@ -320,7 +363,7 @@ function resetSilenceTimer() {
         console.error("recognition.stop() in silenceTimer failed:", e);
       }
     }
-  }, 2500);
+  }, 2500); // ~2.5s of silence after you've spoken
 }
 
 function initSTT() {
@@ -370,6 +413,7 @@ function initSTT() {
     console.error("STT error:", event);
 
     if (event.error === "no-speech" && talkSessionActive && !hasHeardSpeech) {
+      // user clicked Talk but didn't speak; keep session alive
       return;
     }
 
@@ -387,6 +431,7 @@ function initSTT() {
   rec.onend = () => {
     sttActive = false;
 
+    // If user never spoke, keep listening session alive
     if (!talkSessionActive) {
       clearSilenceTimer();
       speechBuffer = "";
@@ -412,6 +457,7 @@ function initSTT() {
       return;
     }
 
+    // If we *have* heard speech, this end means "user finished speaking"
     talkSessionActive = false;
     clearSilenceTimer();
     talkBtn.classList.remove("listening");
@@ -502,6 +548,7 @@ function handleUserUtterance(transcript) {
   addTranscriptLine("user", transcript);
   conversationHistory.push({ role: "user", text: transcript });
 
+  // manual barge-in: stop any AI speech
   stopCurrentAudio();
 
   sendUserTextOverWS(transcript);
@@ -534,6 +581,7 @@ function openWebSocket() {
       })
     );
 
+    // client heartbeat
     heartbeatInterval = setInterval(() => {
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({ type: "ping" }));
@@ -649,6 +697,9 @@ function startSession() {
     return;
   }
 
+  // Unlock audio on a real user gesture (important for iOS)
+  ensureAudioContext();
+
   activeEmail = email;
   activeLmsKey = lmsKeyInput.value.trim() || "";
   sessionActive = true;
@@ -722,7 +773,11 @@ function handleTalkClick() {
     return;
   }
 
-  if (currentAudio) {
+  // make sure audio context is resumed on this gesture (iOS)
+  ensureAudioContext();
+
+  // If AI is currently speaking, interrupt it first
+  if (currentAudioSource) {
     stopCurrentAudio();
   }
 
