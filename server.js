@@ -465,6 +465,7 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    // ----- START SESSION -----
     if (msg.type === "start") {
       try {
         const studentEmail = normalizeEmail(msg.student_email);
@@ -510,6 +511,7 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    // ----- USER TEXT -----
     if (msg.type === "user_text") {
       const text = String(msg.text || "").trim();
       if (!text) return;
@@ -526,6 +528,8 @@ wss.on("connection", (ws) => {
         );
         return;
       }
+
+      const requestId = msg.requestId || crypto.randomUUID();
 
       ws.session.history.push({ role: "user", text });
 
@@ -546,6 +550,7 @@ wss.on("connection", (ws) => {
           JSON.stringify({
             type: "assistant_text",
             text: aiText,
+            requestId,
           })
         );
       } catch (err) {
@@ -560,6 +565,7 @@ wss.on("connection", (ws) => {
       return;
     }
 
+    // ----- STOP -----
     if (msg.type === "stop") {
       ws.close();
       return;

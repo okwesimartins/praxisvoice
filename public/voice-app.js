@@ -3,7 +3,7 @@
 // =======================
 
 // If frontend is served by the same backend, leave API_BASE empty ("").
-// If you host the HTML elsewhere, set it to your Cloud Run URL like:
+// If hosted elsewhere, set it to your Cloud Run URL:
 // const API_BASE = "https://veritas-ai-voice-156084498565.europe-west1.run.app";
 const API_BASE = "";
 
@@ -32,7 +32,8 @@ let recognizing = false;
 let sessionActive = false;
 
 let selectedVoice = null;
-let isSending = false;
+let lastRequestId = null;
+
 let conversation = []; // [{role:"user"|"assistant", text}]
 
 // =======================
@@ -70,6 +71,31 @@ function renderTranscript() {
 }
 
 // =======================
+// TEXT CLEANUP FOR SPEECH
+// =======================
+function sanitizeForSpeech(text) {
+  let t = text;
+
+  // Remove markdown bold/italics markers
+  t = t.replace(/\*\*(.+?)\*\*/g, "$1");
+  t = t.replace(/__(.+?)__/g, "$1");
+  t = t.replace(/\*(.+?)\*/g, "$1");
+  t = t.replace(/_(.+?)_/g, "$1");
+
+  // Remove leading bullets / block markers (*, -, >)
+  t = t.replace(/^[\s>*-]+\s*/gm, "");
+
+  // Remove backticks and backslashes
+  t = t.replace(/`+/g, "");
+  t = t.replace(/\\/g, "");
+
+  // Collapse multiple spaces / newlines
+  t = t.replace(/\s{2,}/g, " ").trim();
+
+  return t;
+}
+
+// =======================
 // BROWSER TTS (speechSynthesis)
 // =======================
 function pickBestVoice() {
@@ -81,10 +107,14 @@ function pickBestVoice() {
 
   console.log("Available voices:", voices);
 
+  // Prefer a calm adult-ish English voice if possible
   selectedVoice =
-    voices.find((v) => /Google UK English Female/i.test(v.name)) ||
+    voices.find(
+      (v) =>
+        /en/i.test(v.lang) &&
+        /Male|Narrator|Daniel|George|Guy/i.test(v.name)
+    ) ||
     voices.find((v) => /Google US English/i.test(v.name)) ||
-    voices.find((v) => /Google English/i.test(v.name)) ||
     voices.find((v) => v.lang === "en-US") ||
     voices.find((v) => v.lang && v.lang.startsWith("en")) ||
     voices[0];
@@ -98,8 +128,11 @@ pickBestVoice();
 function speakText(fullText) {
   if (!sessionActive || !fullText) return;
 
-  // Don't make the browser read full URLs
-  const speakable = fullText.replace(/https?:\/\/\S+/g, "a link I found");
+  // Clean up markdown & weird characters before speaking
+  const cleaned = sanitizeForSpeech(fullText);
+
+  // Don't read full URLs out loud
+  const speakable = cleaned.replace(/https?:\/\/\S+/g, "a link I found");
 
   window.speechSynthesis.cancel();
   const utterance = new SpeechSynthesisUtterance(speakable);
@@ -108,8 +141,9 @@ function speakText(fullText) {
     utterance.voice = selectedVoice;
   }
 
-  utterance.rate = 1.1;   // slightly faster
-  utterance.pitch = 1.05; // slightly brighter
+  // Slower & lower pitch for "teacher" vibe
+  utterance.rate = 0.9;   // was 1.1
+  utterance.pitch = 0.9;  // slightly deeper
   utterance.volume = 1.0;
 
   utterance.onstart = () => {
@@ -120,17 +154,12 @@ function speakText(fullText) {
   utterance.onend = () => {
     speakingIndicator.classList.add("hidden");
     log("Praxis finished speaking.");
-    if (sessionActive) {
-      startListening();
-    }
+    // We do NOT startListening here; recognition runs continuously.
   };
 
   utterance.onerror = (e) => {
     speakingIndicator.classList.add("hidden");
     log(`TTS error: ${e.error}`, true);
-    if (sessionActive) {
-      startListening();
-    }
   };
 
   window.speechSynthesis.speak(utterance);
@@ -151,7 +180,7 @@ function setupRecognition() {
 
   recognition = new SpeechRecognition();
   recognition.lang = "en-US";
-  recognition.continuous = false; // one turn at a time
+  recognition.continuous = true; // keep listening
   recognition.interimResults = true;
 
   recognition.onstart = () => {
@@ -162,13 +191,41 @@ function setupRecognition() {
   recognition.onend = () => {
     recognizing = false;
     log("Stopped listening.");
+    if (sessionActive) {
+      // Auto-restart after a small pause
+      setTimeout(() => {
+        try {
+          recognition.start();
+        } catch (e) {
+          console.log("Recognition restart error:", e.message);
+        }
+      }, 400);
+    }
   };
 
   recognition.onerror = (event) => {
+    if (event.error === "no-speech") {
+      // Harmless: just means silence. Restart.
+      recognizing = false;
+      log("No speech detected, still listening...");
+      if (sessionActive) {
+        setTimeout(() => {
+          try {
+            recognition.start();
+          } catch (e) {}
+        }, 400);
+      }
+      return;
+    }
+
     log(`STT error: ${event.error}`, true);
     recognizing = false;
-    if (sessionActive && event.error !== "no-speech") {
-      setTimeout(() => startListening(), 800);
+    if (sessionActive) {
+      setTimeout(() => {
+        try {
+          recognition.start();
+        } catch (e) {}
+      }, 800);
     }
   };
 
@@ -200,6 +257,11 @@ function setupRecognition() {
     }
 
     if (finalText.trim()) {
+      // 🔹 BARGE-IN: stop AI speech if it's talking
+      if (window.speechSynthesis.speaking) {
+        window.speechSynthesis.cancel();
+        speakingIndicator.classList.add("hidden");
+      }
       handleUserText(finalText.trim());
     }
   };
@@ -210,12 +272,10 @@ function startListening() {
   if (!recognition) setupRecognition();
   if (!recognition) return;
 
-  if (window.speechSynthesis.speaking) {
-    window.speechSynthesis.cancel();
-  }
-
   try {
-    recognition.start();
+    if (!recognizing) {
+      recognition.start();
+    }
   } catch (e) {
     console.log("Recognition start error:", e.message);
   }
@@ -235,17 +295,19 @@ function sendToBackend(text) {
     log("WebSocket not open.", true);
     return;
   }
-  if (isSending) {
-    log("Still waiting for previous reply, skipping...", true);
-    return;
-  }
 
-  isSending = true;
+  const requestId = `${Date.now()}-${Math.random()
+    .toString(36)
+    .slice(2, 9)}`;
+  lastRequestId = requestId;
+
   log(`Sending to backend: "${text}"`);
+
   ws.send(
     JSON.stringify({
       type: "user_text",
       text,
+      requestId,
     })
   );
 }
@@ -255,7 +317,7 @@ function handleUserText(text) {
   conversation.push({ role: "user", text });
   renderTranscript();
 
-  stopListening();
+  // Keep listening; don't stop recognition here.
   sendToBackend(text);
 }
 
@@ -269,7 +331,7 @@ function handleStart() {
     return;
   }
 
-  sessionActive = false; // will flip true on "ready"
+  sessionActive = false;
   conversation = [];
   renderTranscript();
 
@@ -304,15 +366,18 @@ function handleStart() {
     if (msg.type === "ready") {
       log("Backend ready. You can start speaking.");
       sessionActive = true;
-      isSending = false;
       startListening();
       return;
     }
 
     if (msg.type === "assistant_text") {
-      const reply = msg.text || "";
-      isSending = false;
+      // Ignore stale replies from previous questions (after barge-in)
+      if (msg.requestId && lastRequestId && msg.requestId !== lastRequestId) {
+        console.log("Ignoring stale response:", msg.requestId);
+        return;
+      }
 
+      const reply = msg.text || "";
       conversation.push({ role: "assistant", text: reply });
       renderTranscript();
       speakText(reply);
@@ -321,10 +386,6 @@ function handleStart() {
 
     if (msg.type === "error") {
       log(`ERROR: ${msg.error}`, true);
-      isSending = false;
-      if (sessionActive) {
-        setTimeout(() => startListening(), 1000);
-      }
       return;
     }
   };
@@ -337,7 +398,6 @@ function handleStart() {
   ws.onclose = () => {
     log("WebSocket closed / session ended");
     sessionActive = false;
-    isSending = false;
     stopListening();
     window.speechSynthesis.cancel();
     speakingIndicator.classList.add("hidden");
@@ -353,13 +413,13 @@ function handleStop() {
   sessionActive = false;
   stopListening();
   window.speechSynthesis.cancel();
+  speakingIndicator.classList.add("hidden");
 
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "stop" }));
     ws.close();
   }
 
-  speakingIndicator.classList.add("hidden");
   log("Session stopped.");
 }
 
