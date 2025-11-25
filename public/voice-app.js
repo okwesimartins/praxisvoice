@@ -1,244 +1,255 @@
-const BACKEND_URL = "https://veritas-ai-voice-156084498565.europe-west1.run.app";
+// public/voice-app.js
 
-// DOM elements
-const emailInput = document.getElementById('email');
-const lmsKeyInput = document.getElementById('lmsKey');
-const startBtn = document.getElementById('startBtn');
-const stopBtn = document.getElementById('stopBtn');
-const transcriptEl = document.getElementById('transcript');
-const logsEl = document.getElementById('logs');
-const speakingIndicator = document.getElementById('speakingIndicator');
+// If you want to hard-code Cloud Run URL, set this.
+// If frontend is served by the same backend, leave as null to auto-detect.
+const BACKEND_URL = null; // e.g. "https://veritas-ai-voice-XXXX.run.app";
 
-// State
+const emailInput = document.getElementById("email");
+const lmsKeyInput = document.getElementById("lmsKey");
+const startBtn = document.getElementById("startBtn");
+const stopBtn = document.getElementById("stopBtn");
+const transcriptEl = document.getElementById("transcript");
+const logsEl = document.getElementById("logs");
+const speakingIndicator = document.getElementById("speakingIndicator");
+
 let ws = null;
-let audioCtx = null;
-let micStream = null;
-let processor = null;
-let playTime = 0;
+let recognition = null;
 let isConnected = false;
-let currentTranscript = '';
+let currentTranscript = "";
 
-// Logging
+// -----------------------------------------------------------------------------
+// Logging helper
+// -----------------------------------------------------------------------------
 function log(message, isError = false) {
   const timestamp = new Date().toLocaleTimeString();
-  const logEntry = document.createElement('div');
-  logEntry.className = `log-entry${isError ? ' error' : ''}`;
-  logEntry.textContent = `[${timestamp}] ${message}`;
-  logsEl.appendChild(logEntry);
+  const entry = document.createElement("div");
+  entry.className = `log-entry${isError ? " error" : ""}`;
+  entry.textContent = `[${timestamp}] ${message}`;
+  logsEl.appendChild(entry);
   logsEl.scrollTop = logsEl.scrollHeight;
-  console.log(isError ? '[LOG:ERROR]' : '[LOG]', message);
+  console.log(isError ? "[LOG:ERROR]" : "[LOG]", message);
 }
 
-// Audio encoding utilities
-function base64FromArrayBuffer(ab) {
-  let binary = '';
-  const bytes = new Uint8Array(ab);
-  for (let i = 0; i < bytes.byteLength; i++) {
-    binary += String.fromCharCode(bytes[i]);
+// -----------------------------------------------------------------------------
+// Speech Recognition (browser STT)
+// -----------------------------------------------------------------------------
+function initSpeechRecognition() {
+  const SR =
+    window.SpeechRecognition || window.webkitSpeechRecognition || null;
+  if (!SR) {
+    log(
+      "SpeechRecognition API is not supported in this browser. Use Chrome or Edge.",
+      true
+    );
+    return null;
   }
-  return btoa(binary);
-}
 
-function arrayBufferFromBase64(b64) {
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes.buffer;
-}
+  const rec = new SR();
+  rec.continuous = true;
+  rec.interimResults = true;
+  rec.lang = "en-US";
 
-function floatTo16BitPCM(float32) {
-  const out = new Int16Array(float32.length);
-  for (let i = 0; i < float32.length; i++) {
-    let s = Math.max(-1, Math.min(1, float32[i]));
-    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-  }
-  return out;
-}
+  rec.onstart = () => {
+    log("Microphone listening...");
+  };
 
-function downsampleBuffer(buffer, sampleRate, outRate = 16000) {
-  if (outRate === sampleRate) return buffer;
-  const ratio = sampleRate / outRate;
-  const newLen = Math.round(buffer.length / ratio);
-  const result = new Float32Array(newLen);
-  let offset = 0;
-  
-  for (let i = 0; i < newLen; i++) {
-    const nextOffset = Math.round((i + 1) * ratio);
-    let sum = 0, count = 0;
-    for (let j = offset; j < nextOffset && j < buffer.length; j++) {
-      sum += buffer[j];
-      count++;
+  rec.onerror = (event) => {
+    log(`SpeechRecognition error: ${event.error}`, true);
+  };
+
+  rec.onend = () => {
+    log("SpeechRecognition stopped.");
+    if (isConnected) {
+      // Automatically restart to keep listening during session
+      try {
+        rec.start();
+      } catch (_) {}
     }
-    result[i] = sum / count;
-    offset = nextOffset;
-  }
-  return result;
-}
+  };
 
-// Microphone management
-async function startMic() {
-  try {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    micStream = await navigator.mediaDevices.getUserMedia({ 
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true
-      } 
-    });
-    
-    const source = audioCtx.createMediaStreamSource(micStream);
-    processor = audioCtx.createScriptProcessor(4096, 1, 1);
-    source.connect(processor);
-    processor.connect(audioCtx.destination);
+  rec.onresult = (event) => {
+    const last = event.results[event.results.length - 1];
+    const text = last[0].transcript.trim();
+    if (!text) return;
 
-    processor.onaudioprocess = (e) => {
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      const input = e.inputBuffer.getChannelData(0);
-      const down = downsampleBuffer(input, audioCtx.sampleRate, 16000);
-      const pcm16 = floatTo16BitPCM(down);
-      const buffer = pcm16.buffer;
-      ws.send(JSON.stringify({ 
-        type: "audio", 
-        data: base64FromArrayBuffer(buffer) 
-      }));
-    };
-
-    log('Microphone started');
-  } catch (error) {
-    log(`Mic error: ${error.message}`, true);
-  }
-}
-
-function stopMic() {
-  if (processor) {
-    processor.disconnect();
-    processor = null;
-  }
-  if (micStream) {
-    micStream.getTracks().forEach(t => t.stop());
-    micStream = null;
-  }
-  if (audioCtx && audioCtx.state !== 'closed') {
-    audioCtx.close();
-    audioCtx = null;
-  }
-  log('Microphone stopped');
-}
-
-// Audio playback with 1.2x speed
-function playPcm16(base64Pcm) {
-  if (!audioCtx) return;
-
-  try {
-    const ab = arrayBufferFromBase64(base64Pcm);
-    const pcm16 = new Int16Array(ab);
-    const float32 = new Float32Array(pcm16.length);
-    
-    for (let i = 0; i < pcm16.length; i++) {
-      float32[i] = pcm16[i] / 0x8000;
+    // Show interim text in logs (optional)
+    if (!last.isFinal) {
+      log(`(hearing) ${text}`);
+      return;
     }
 
-    const targetRate = 16000 * 1.2;
-    const buf = audioCtx.createBuffer(1, float32.length, targetRate);
-    buf.copyToChannel(float32, 0);
+    // Final recognized user utterance
+    log(`You: ${text}`);
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(
+        JSON.stringify({
+          type: "userText",
+          text,
+        })
+      );
+    }
+  };
 
-    const src = audioCtx.createBufferSource();
-    src.buffer = buf;
-    src.connect(audioCtx.destination);
+  return rec;
+}
 
-    const now = audioCtx.currentTime;
-    if (playTime < now) playTime = now;
-    src.start(playTime);
-    playTime += buf.duration;
+function startListening() {
+  if (!recognition) {
+    recognition = initSpeechRecognition();
+  }
+  if (!recognition) return;
 
-    speakingIndicator.classList.remove('hidden');
-    setTimeout(() => speakingIndicator.classList.add('hidden'), buf.duration * 1000);
-  } catch (error) {
-    log(`Audio error: ${error.message}`, true);
+  try {
+    recognition.start();
+  } catch (e) {
+    // Starting twice throws in some browsers; ignore
   }
 }
 
-// WebSocket management
-function handleStart() {
-  const email = emailInput.value.trim();
-  if (!email) {
-    log('Please enter student email', true);
+function stopListening() {
+  if (recognition) {
+    try {
+      recognition.onend = null; // prevent auto-restart
+      recognition.stop();
+    } catch (_) {}
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Text-to-speech (browser TTS)
+// -----------------------------------------------------------------------------
+function speak(text) {
+  if (!("speechSynthesis" in window)) {
+    log("speechSynthesis not supported in this browser.", true);
     return;
   }
 
-  currentTranscript = '';
-  transcriptEl.textContent = 'Transcript will appear here...';
-  log('Connecting to backend...');
+  // Cancel any previous speech
+  window.speechSynthesis.cancel();
 
-  const wsUrl = `${BACKEND_URL.replace('https://', 'wss://')}/ws`;
-  console.log("🔌 Connecting to WS:", wsUrl);
+  const utterance = new SpeechSynthesisUtterance(text);
+  // Slightly faster + brighter
+  utterance.rate = 1.15;
+  utterance.pitch = 1.05;
+
+  utterance.onstart = () => {
+    speakingIndicator.classList.remove("hidden");
+  };
+  utterance.onend = () => {
+    speakingIndicator.classList.add("hidden");
+  };
+  utterance.onerror = (e) => {
+    log(`TTS error: ${e.error}`, true);
+    speakingIndicator.classList.add("hidden");
+  };
+
+  window.speechSynthesis.speak(utterance);
+}
+
+// -----------------------------------------------------------------------------
+// WebSocket management
+// -----------------------------------------------------------------------------
+function getWsUrl() {
+  if (BACKEND_URL) {
+    return BACKEND_URL.replace(/^http/i, "ws") + "/ws";
+  }
+  return (
+    (location.protocol === "https:" ? "wss://" : "ws://") +
+    location.host +
+    "/ws"
+  );
+}
+
+function handleStart() {
+  const email = emailInput.value.trim();
+  if (!email) {
+    log("Please enter student email", true);
+    return;
+  }
+
+  currentTranscript = "";
+  transcriptEl.textContent = "Transcript will appear here...";
+  log("Connecting to backend...");
+
+  const wsUrl = getWsUrl();
+  log(`WS URL: ${wsUrl}`);
   ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {
-    log('WebSocket connected');
-    console.log("📤 Sending start message");
-    ws.send(JSON.stringify({
-      type: "start",
-      student_email: email,
-      lmsKey: lmsKeyInput.value.trim() || undefined
-    }));
+    log("WebSocket connected");
+    ws.send(
+      JSON.stringify({
+        type: "start",
+        student_email: email,
+        lmsKey: lmsKeyInput.value.trim() || undefined,
+      })
+    );
   };
 
-  ws.onmessage = async (e) => {
-    console.log("📥 Raw WS message:", e.data);
-    const msg = JSON.parse(e.data);
-    console.log("📥 Parsed WS message:", msg);
+  ws.onmessage = async (event) => {
+    let msg;
+    try {
+      msg = JSON.parse(event.data);
+    } catch {
+      console.warn("Non-JSON WS message:", event.data);
+      return;
+    }
+
+    console.log("📥 WS message:", msg);
 
     if (msg.type === "ready") {
-      log('Gemini ready - starting mic...');
+      log("Praxis is ready. Starting microphone...");
       isConnected = true;
       startBtn.disabled = true;
       stopBtn.disabled = false;
       emailInput.disabled = true;
       lmsKeyInput.disabled = true;
-      await startMic();
+      startListening();
     }
 
-    if (msg.type === "text") {
-      console.log("📝 AI text chunk:", msg.text);
+    if (msg.type === "aiThinking") {
+      log("Praxis is thinking...");
+    }
+
+    if (msg.type === "aiText") {
       // Clear placeholder on first chunk
-      if (!currentTranscript || currentTranscript === 'Transcript will appear here...') {
-        currentTranscript = '';
-        transcriptEl.textContent = '';
+      if (
+        !currentTranscript ||
+        currentTranscript === "Transcript will appear here..."
+      ) {
+        currentTranscript = "";
+        transcriptEl.textContent = "";
       }
-      currentTranscript += (currentTranscript ? ' ' : '') + msg.text;
+
+      // Append AI text to transcript
+      currentTranscript +=
+        (currentTranscript ? "\n\n" : "") + String(msg.text || "");
       transcriptEl.textContent = currentTranscript;
       transcriptEl.scrollTop = transcriptEl.scrollHeight;
-      log(`AI: ${msg.text}`);
-    }
 
-    if (msg.type === "audio") {
-      console.log("🔊 Received audio chunk");
-      playPcm16(msg.data);
+      log(`AI: ${msg.text}`);
+      speak(msg.text);
     }
 
     if (msg.type === "error") {
       log(`ERROR: ${msg.error}`, true);
     }
 
-    if (msg.type === "turnComplete") {
-      speakingIndicator.classList.add('hidden');
+    if (msg.type === "info") {
+      log(msg.message || "Info from server");
     }
   };
 
   ws.onerror = (event) => {
-    console.error("WS error event:", event);
-    log('WebSocket error', true);
+    console.error("WS error:", event);
+    log("WebSocket error", true);
   };
 
   ws.onclose = () => {
-    log('Session ended');
-    stopMic();
-    speakingIndicator.classList.add('hidden');
+    log("Session ended");
     isConnected = false;
+    stopListening();
+    speakingIndicator.classList.add("hidden");
     startBtn.disabled = false;
     stopBtn.disabled = true;
     emailInput.disabled = false;
@@ -247,19 +258,25 @@ function handleStart() {
 }
 
 function handleStop() {
+  log("Stopping session...");
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "stop" }));
     ws.close();
+  } else {
+    stopListening();
   }
-  log('Stopping session...');
 }
 
-// Event listeners
-startBtn.addEventListener('click', handleStart);
-stopBtn.addEventListener('click', handleStop);
+// -----------------------------------------------------------------------------
+// UI events
+// -----------------------------------------------------------------------------
+startBtn.addEventListener("click", handleStart);
+stopBtn.addEventListener("click", handleStop);
 
-// Cleanup on page unload
-window.addEventListener('beforeunload', () => {
-  if (ws) ws.close();
-  stopMic();
+window.addEventListener("beforeunload", () => {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+  stopListening();
+  if ("speechSynthesis" in window) {
+    window.speechSynthesis.cancel();
+  }
 });
