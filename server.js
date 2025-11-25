@@ -1,9 +1,10 @@
 /**
- * server.js — Praxis Voice Backend (HTTP + WebSocket, text-only Gemini)
- * - Express health + serves static frontend (public/)
- * - POST /api/chat: HTTP text endpoint
- * - WS /ws: browser text <-> Gemini text API (for voice UI)
- * - Pluralcode student scope enforcement
+ * server.js — Praxis Voice Backend (Cloud Run)
+ * - Express health + optional static frontend (public/)
+ * - WS /ws: browser audio <-> Gemini Live API
+ * - Enforces LMS key + student course scope
+ * - Supports tool calling (Google Web + YouTube search)
+ * - NEW: Google Cloud Speech-to-Text on Gemini's audio output to get transcript
  */
 
 if (process.env.NODE_ENV !== "production") {
@@ -14,9 +15,13 @@ const http = require("http");
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
+const WebSocket = require("ws");
 const crypto = require("crypto");
 const { google } = require("googleapis");
-const WebSocket = require("ws");
+const speech = require("@google-cloud/speech");
+
+// Google Cloud Speech client (uses GOOGLE_APPLICATION_CREDENTIALS or default creds)
+const speechClient = new speech.SpeechClient();
 
 // ---- fetch polyfill (Node < 18) ----
 let fetchFn = global.fetch;
@@ -27,32 +32,34 @@ if (!fetchFn) {
 const fetch = (...args) => fetchFn(...args);
 
 // Crash logging so Cloud Run shows real reasons
-process.on("uncaughtException", (e) => console.error("UNCAUGHT_EXCEPTION", e));
+process.on("uncaughtException", (e) =>
+  console.error("UNCAUGHT_EXCEPTION", e)
+);
 process.on("unhandledRejection", (e) =>
   console.error("UNHANDLED_REJECTION", e)
 );
 
 // -----------------------------------------------------------------------------
-// EXPRESS APP (health + static frontend)
+// EXPRESS APP (health + optional static frontend from /public)
 // -----------------------------------------------------------------------------
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-// Health endpoints
 app.get("/", (req, res) =>
-  res.json({ status: "ok", service: "Praxis Voice API (HTTP+WS)" })
+  res.json({ status: "ok", service: "Praxis Voice API" })
 );
 app.get("/health", (req, res) => res.json({ status: "healthy" }));
 
-// Serve static frontend from /public
-app.use(express.static(path.join(__dirname, "public")));
+// If you deploy frontend from the same service, put voice-app.html in ./public
+const publicDir = path.join(__dirname, "public");
+app.use(express.static(publicDir));
 app.get("/voice", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "voice-app.html"));
+  res.sendFile(path.join(publicDir, "voice-app.html"));
 });
 
 // -----------------------------------------------------------------------------
-// Pluralcode scope enforcement (unchanged)
+// Pluralcode scope enforcement
 // -----------------------------------------------------------------------------
 const PLURALCODE_API_BASE =
   process.env.PLURALCODE_API_URL || "https://backend.pluralcode.institute";
@@ -217,13 +224,11 @@ function buildContextHeader(studentEmail, enrolledCourseNames, allowedPhrases) {
 Student Email: ${studentEmail}
 Enrolled Course(s): "${enrolledCourseNames}"
 [ALLOWED TOPICS SAMPLE] (truncated): ${sample}
-[POLICY] Answer ONLY if the topic is within the student's curriculum/sandbox. If out of scope, say it's outside their program and offer 2–3 in-scope alternatives.
-
-When giving YouTube videos or articles, include full clickable links in the text response. Avoid reading out full URLs; just describe them briefly in natural language.`;
+[POLICY] Answer ONLY if the topic is within the student's curriculum/sandbox. If out of scope, briefly say it's outside their program and offer 2–3 in-scope alternatives.`;
 }
 
 // -----------------------------------------------------------------------------
-// (Optional) Google search tools - still available if you want to wire later
+// Google search tools
 // -----------------------------------------------------------------------------
 const Google_Search_API_KEY = process.env.Google_Search_API_KEY;
 const Google_Search_CX_ID = process.env.Google_Search_CX_ID;
@@ -312,18 +317,48 @@ async function search_web_for_articles({ query }) {
     : { message: `No articles found for "${query}".` };
 }
 
-// -----------------------------------------------------------------------------
-// Gemini text API (HTTP)
-// -----------------------------------------------------------------------------
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-if (!GEMINI_API_KEY) {
-  console.warn("⚠️ GEMINI_API_KEY not set in environment!");
-}
+const availableTools = { search_youtube_for_videos, search_web_for_articles };
 
-const RAW_MODEL = process.env.GEMINI_MODEL || "models/gemini-2.0-flash-exp";
-const GEMINI_MODEL = RAW_MODEL.startsWith("models/")
-  ? RAW_MODEL
-  : `models/${RAW_MODEL}`;
+const toolDefs = [
+  {
+    functionDeclarations: [
+      {
+        name: "search_web_for_articles",
+        description:
+          "Search the web for high-quality articles, blog posts, and official documentation.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            query: { type: "STRING", description: "A detailed search query." },
+          },
+          required: ["query"],
+        },
+      },
+      {
+        name: "search_youtube_for_videos",
+        description: "Search YouTube for relevant tutorial videos.",
+        parameters: {
+          type: "OBJECT",
+          properties: {
+            query: { type: "STRING", description: "A detailed search query." },
+          },
+          required: ["query"],
+        },
+      },
+    ],
+  },
+];
+
+// -----------------------------------------------------------------------------
+// Gemini Live API bridge
+// -----------------------------------------------------------------------------
+const GEMINI_LIVE_WS =
+  "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
+
+const LIVE_MODEL_ENV =
+  process.env.GEMINI_LIVE_MODEL || "gemini-2.5-flash-native-audio-preview-09-2025";
+const LIVE_MODEL =
+  LIVE_MODEL_ENV.startsWith("models/") ? LIVE_MODEL_ENV : `models/${LIVE_MODEL_ENV}`;
 
 const BASE_SYSTEM_INSTRUCTION = `
 You are Praxis, a specialized AI tutor for Pluralcode Academy.
@@ -334,140 +369,137 @@ PLURALCODE KNOWLEDGE BASE (MANDATORY USAGE)
 CORE RULES
 1) Stay strictly within the student's enrolled course scope; sandbox topics are always allowed.
 2) If out of scope, say so briefly and offer 2–3 in-scope alternatives.
-3) Prefer authoritative sources when suggesting external resources.
-4) Include links in text when appropriate (YouTube, documentation, articles). Do not read out full URLs; summarize verbally instead.
+3) Prefer authoritative sources when searching the web.
+Do NOT invent links.
 `;
 
-/**
- * Call Gemini text model with system instruction + contents array.
- * contents: [{ role: "user"|"model", parts:[{ text }] }, ...]
- */
-async function callGeminiChat({ systemInstruction, contents }) {
-  if (!GEMINI_API_KEY) {
-    throw new Error("GEMINI_API_KEY is missing.");
-  }
+function openGeminiLiveSocket({ systemInstruction, tools }) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) throw new Error("GEMINI_API_KEY missing in env.");
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(
-    GEMINI_API_KEY
-  )}`;
+  const ws = new WebSocket(
+    `${GEMINI_LIVE_WS}?key=${encodeURIComponent(apiKey)}`
+  );
 
-  const body = {
-    systemInstruction: {
-      parts: [{ text: systemInstruction }],
-    },
-    contents,
-    generationConfig: {
-      temperature: 0.4,
-      maxOutputTokens: 512,
-    },
-  };
+  ws.on("open", () => {
+    const setupPayload = {
+      setup: {
+        model: LIVE_MODEL,
+        generationConfig: {
+          responseModalities: ["AUDIO"],
+          temperature: 0.4,
+          maxOutputTokens: 512,
+          speechConfig: {
+            voiceConfig: {
+              prebuiltVoiceConfig: {
+                voiceName: "Puck", // lighter voice
+              },
+            },
+          },
+        },
+        systemInstruction: {
+          parts: [{ text: systemInstruction }],
+        },
+      },
+    };
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
+    if (
+      tools &&
+      Array.isArray(tools) &&
+      tools.length > 0 &&
+      tools[0].functionDeclarations?.length > 0
+    ) {
+      setupPayload.setup.tools = tools;
+    }
+
+    console.log("📤 Sending Gemini setup:", JSON.stringify(setupPayload, null, 2));
+    ws.send(JSON.stringify(setupPayload));
   });
 
-  if (!res.ok) {
-    const errText = await res.text();
-    console.error("Gemini error response:", errText);
-    throw new Error(`Gemini API error: ${res.status}`);
-  }
-
-  const data = await res.json();
-  const parts =
-    data.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean) ||
-    [];
-  const text = parts.join(" ").trim() || "(no response text)";
-  return text;
+  return ws;
 }
 
 // -----------------------------------------------------------------------------
-// POST /api/chat  (kept for non-WS clients)
-// -----------------------------------------------------------------------------
-app.post("/api/chat", async (req, res) => {
-  try {
-    const { student_email, lmsKey, message, history } = req.body || {};
-
-    if (!student_email || !message) {
-      return res.status(400).json({
-        error: "student_email and message are required.",
-      });
-    }
-
-    if (lmsKey && lmsKey !== process.env.MY_LMS_API_KEY) {
-      return res.status(403).json({ error: "Invalid LMS key." });
-    }
-
-    const studentEmail = normalizeEmail(student_email);
-    const scope = await getStudentScope(studentEmail);
-    const enrolledCourseNames = scope.courseNames.join(", ");
-    const allowedPhrases = scope.allowedPhrases;
-
-    const header = buildContextHeader(
-      studentEmail,
-      enrolledCourseNames,
-      allowedPhrases
-    );
-    const systemInstruction = `${BASE_SYSTEM_INSTRUCTION}\n\n${header}`;
-
-    const contents = [];
-
-    if (Array.isArray(history)) {
-      for (const h of history) {
-        if (!h || !h.text) continue;
-        let role = "user";
-        if (h.role === "assistant" || h.role === "model") role = "model";
-        contents.push({
-          role,
-          parts: [{ text: h.text }],
-        });
-      }
-    }
-
-    contents.push({
-      role: "user",
-      parts: [{ text: message }],
-    });
-
-    const aiText = await callGeminiChat({
-      systemInstruction,
-      contents,
-    });
-
-    return res.json({ text: aiText });
-  } catch (err) {
-    console.error("❌ /api/chat error:", err);
-    return res.status(500).json({ error: err.message || "Server error" });
-  }
-});
-
-// -----------------------------------------------------------------------------
-// WebSocket /ws — text chat for voice UI
+// HTTP + WebSocket server
 // -----------------------------------------------------------------------------
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/ws" });
 
-wss.on("connection", (ws) => {
-  ws.id = crypto.randomUUID();
-  ws.session = null;
+wss.on("connection", (clientWs) => {
+  let geminiWs = null;
+  let sessionId = crypto.randomUUID();
 
-  console.log("WS client connected:", ws.id);
+  // STT stream for AI audio -> text
+  let sttStream = null;
 
-  ws.on("message", async (raw) => {
+  const startSttStream = () => {
+    if (sttStream) return sttStream;
+
+    sttStream = speechClient
+      .streamingRecognize({
+        config: {
+          encoding: "LINEAR16",
+          sampleRateHertz: 16000,
+          languageCode: "en-US",
+          enableAutomaticPunctuation: true,
+        },
+        interimResults: false,
+      })
+      .on("error", (err) => {
+        console.error("STT stream error:", err);
+      })
+      .on("data", (data) => {
+        const result = data.results?.[0];
+        if (!result) return;
+        const alt = result.alternatives?.[0];
+        if (!alt || !alt.transcript) return;
+
+        const transcript = alt.transcript.trim();
+        if (!transcript) return;
+
+        // Send AI transcript chunk to browser
+        sendClient({ type: "text", text: transcript });
+      })
+      .on("end", () => {
+        sttStream = null;
+      });
+
+    return sttStream;
+  };
+
+  const stopSttStream = () => {
+    if (sttStream) {
+      try {
+        sttStream.end();
+      } catch (_) {}
+      sttStream = null;
+    }
+  };
+
+  const sendClient = (obj) => {
+    if (clientWs.readyState === WebSocket.OPEN) {
+      clientWs.send(JSON.stringify(obj));
+    }
+  };
+
+  clientWs.on("message", async (raw) => {
     let msg;
     try {
       msg = JSON.parse(raw.toString());
-    } catch (e) {
-      console.error("Bad WS JSON:", e);
+    } catch {
       return;
     }
 
-    // ----- START SESSION -----
     if (msg.type === "start") {
       try {
+        sessionId = msg.sessionId || sessionId;
+
+        if (msg.lmsKey && msg.lmsKey !== process.env.MY_LMS_API_KEY) {
+          sendClient({ type: "error", error: "Unauthorized client" });
+          clientWs.close();
+          return;
+        }
+
         const studentEmail = normalizeEmail(msg.student_email);
         const scope = await getStudentScope(studentEmail);
         const enrolledCourseNames = scope.courseNames.join(", ");
@@ -478,115 +510,154 @@ wss.on("connection", (ws) => {
           enrolledCourseNames,
           allowedPhrases
         );
-        const systemInstruction = `${BASE_SYSTEM_INSTRUCTION}\n\n${header}`;
 
-        ws.session = {
-          studentEmail,
-          lmsKey: msg.lmsKey,
-          systemInstruction,
-          history: [],
-        };
+        const sys = `${BASE_SYSTEM_INSTRUCTION}\n\n${header}`;
 
-        ws.send(JSON.stringify({ type: "ready" }));
-      } catch (err) {
-        console.error("WS start error:", err);
-        ws.send(
-          JSON.stringify({
+        geminiWs = openGeminiLiveSocket({
+          systemInstruction: sys,
+          tools: toolDefs,
+        });
+
+        geminiWs.on("message", async (data) => {
+          let gm;
+          try {
+            gm = JSON.parse(data.toString());
+          } catch {
+            return;
+          }
+
+          if (gm.setupComplete) {
+            console.log("✅ Gemini setup complete");
+            sendClient({ type: "ready", sessionId });
+          }
+
+          const parts = gm?.serverContent?.modelTurn?.parts || [];
+          for (const p of parts) {
+            if (p.inlineData?.mimeType?.startsWith("audio/pcm")) {
+              const base64Audio = p.inlineData.data;
+
+              // 1) Forward audio to browser to play
+              sendClient({ type: "audio", data: base64Audio });
+
+              // 2) Send same audio to Google STT so we get text transcript
+              try {
+                const stt = startSttStream();
+                const audioBuffer = Buffer.from(base64Audio, "base64");
+                stt.write({ audioContent: audioBuffer });
+              } catch (err) {
+                console.error("STT write error:", err);
+              }
+            }
+
+            // Optional: you can keep Gemini raw text if you want
+            // but STT transcript will reflect what is actually spoken.
+            if (p.text) {
+              // If this is too noisy, you can comment it out.
+              // sendClient({ type: "text", text: p.text });
+            }
+          }
+
+          if (gm.toolCall?.functionCalls?.length) {
+            console.log(
+              "🔧 Tool calls:",
+              gm.toolCall.functionCalls.map((fc) => fc.name)
+            );
+            const functionResponses = [];
+            for (const fc of gm.toolCall.functionCalls) {
+              const fn = availableTools[fc.name];
+              if (!fn) continue;
+              const toolResult = await fn(fc.args || {});
+              functionResponses.push({
+                id: fc.id,
+                name: fc.name,
+                response: {
+                  name: fc.name,
+                  content: [{ text: JSON.stringify(toolResult) }],
+                },
+              });
+            }
+            if (functionResponses.length) {
+              geminiWs.send(
+                JSON.stringify({ toolResponse: { functionResponses } })
+              );
+            }
+          }
+
+          if (gm?.serverContent?.turnComplete) {
+            // End STT stream for this spoken turn
+            stopSttStream();
+            sendClient({ type: "turnComplete" });
+          }
+        });
+
+        geminiWs.on("close", (code, reason) => {
+          console.error(
+            "❌ Gemini WS closed:",
+            code,
+            reason?.toString() || ""
+          );
+          stopSttStream();
+          sendClient({
             type: "error",
-            error: err.message || "Failed to start session",
-          })
-        );
-        ws.close();
+            error: `Gemini WS closed: ${code} ${reason || ""}`,
+          });
+          clientWs.close();
+        });
+
+        geminiWs.on("error", (e) => {
+          console.error("❌ Gemini WS error:", e);
+          sendClient({ type: "error", error: e.message || "Gemini WS error" });
+        });
+      } catch (e) {
+        console.error("❌ Start error:", e);
+        sendClient({ type: "error", error: e.message });
       }
       return;
     }
 
-    if (!ws.session) {
-      ws.send(
+    if (!geminiWs || geminiWs.readyState !== WebSocket.OPEN) return;
+
+    if (msg.type === "audio") {
+      geminiWs.send(
         JSON.stringify({
-          type: "error",
-          error: "Session not initialized. Send a 'start' message first.",
+          realtimeInput: {
+            audio: {
+              mimeType: "audio/pcm;rate=16000",
+              data: msg.data,
+            },
+          },
         })
       );
       return;
     }
 
-    // ----- USER TEXT -----
-    if (msg.type === "user_text") {
-      const text = String(msg.text || "").trim();
-      if (!text) return;
-
-      if (
-        ws.session.lmsKey &&
-        ws.session.lmsKey !== process.env.MY_LMS_API_KEY
-      ) {
-        ws.send(
-          JSON.stringify({
-            type: "error",
-            error: "Invalid LMS key.",
-          })
-        );
-        return;
-      }
-
-      const requestId = msg.requestId || crypto.randomUUID();
-
-      ws.session.history.push({ role: "user", text });
-
-      const contents = ws.session.history.map((h) => ({
-        role: h.role === "assistant" ? "model" : "user",
-        parts: [{ text: h.text }],
-      }));
-
-      try {
-        const aiText = await callGeminiChat({
-          systemInstruction: ws.session.systemInstruction,
-          contents,
-        });
-
-        ws.session.history.push({ role: "assistant", text: aiText });
-
-        ws.send(
-          JSON.stringify({
-            type: "assistant_text",
-            text: aiText,
-            requestId,
-          })
-        );
-      } catch (err) {
-        console.error("WS chat error:", err);
-        ws.send(
-          JSON.stringify({
-            type: "error",
-            error: err.message || "Gemini error",
-          })
-        );
-      }
+    if (msg.type === "text") {
+      geminiWs.send(
+        JSON.stringify({
+          realtimeInput: { text: msg.text || "" },
+        })
+      );
       return;
     }
 
-    // ----- STOP -----
     if (msg.type === "stop") {
-      ws.close();
+      geminiWs.send(
+        JSON.stringify({
+          realtimeInput: { audioStreamEnd: true },
+        })
+      );
+      stopSttStream();
       return;
     }
   });
 
-  ws.on("close", () => {
-    console.log("WS client disconnected:", ws.id);
-  });
-
-  ws.on("error", (e) => {
-    console.error("WS error:", e);
+  clientWs.on("close", () => {
+    if (geminiWs && geminiWs.readyState === WebSocket.OPEN) geminiWs.close();
+    stopSttStream();
   });
 });
 
-// -----------------------------------------------------------------------------
-// HTTP server
-// -----------------------------------------------------------------------------
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, "0.0.0.0", () =>
-  console.log(
-    `🚀 Praxis Voice HTTP+WS listening on ${PORT}, model=${GEMINI_MODEL}`
-  )
+  console.log(`🚀 Praxis Voice listening on ${PORT}, model=${LIVE_MODEL}`)
 );

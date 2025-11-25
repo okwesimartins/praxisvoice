@@ -1,6 +1,6 @@
 // ================= CONFIG =================
 
-// Assuming frontend is served by the same server.js (same origin)
+// WebSocket URL (same origin as server.js)
 const WS_URL =
   (location.protocol === "https:" ? "wss://" : "ws://") +
   location.host +
@@ -19,31 +19,24 @@ const speakingIndicator = document.getElementById("speakingIndicator");
 // ================= STATE =================
 
 let ws = null;
-let wsReady = false;
+let audioCtx = null;
+let micStream = null;
+let processor = null;
+let playTime = 0;
 
-let recognition = null;
-let recognizing = false;
-let shouldKeepListening = false;
+// ================= LOGGING =================
 
-let currentTtsText = "";  // lowercased text currently being spoken
-let voicesLoaded = false;
-
-let conversationHistory = [];  // just for UI
-let lastRequestId = null;
-
-// ================= UTIL: LOGGING =================
-
-function log(msg, isError = false) {
+function log(message, isError = false) {
   const timestamp = new Date().toLocaleTimeString();
   const div = document.createElement("div");
   div.className = "log-entry" + (isError ? " error" : "");
-  div.textContent = `[${timestamp}] ${msg}`;
+  div.textContent = `[${timestamp}] ${message}`;
   logsEl.appendChild(div);
   logsEl.scrollTop = logsEl.scrollHeight;
-  console[isError ? "error" : "log"](msg);
+  console[isError ? "error" : "log"](message);
 }
 
-// ================= UTIL: TRANSCRIPT UI =================
+// ================= TRANSCRIPT UI =================
 
 function clearTranscriptIfPlaceholder() {
   if (transcriptEl.textContent.trim() === "Transcript will appear here...") {
@@ -54,232 +47,154 @@ function clearTranscriptIfPlaceholder() {
 function addTranscriptLine(role, text) {
   clearTranscriptIfPlaceholder();
   const line = document.createElement("div");
-  line.className = "transcript-line " + role; // "user" or "assistant"
-  line.textContent = (role === "user" ? "You: " : "Praxis: ") + text;
+  line.className = "transcript-line " + role; // "assistant"
+  line.textContent = (role === "assistant" ? "Praxis: " : "") + text;
   transcriptEl.appendChild(line);
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
-// ================= TTS: SPEAKING =================
+// ================= AUDIO UTILS =================
 
-function sanitizeForSpeech(fullText) {
-  if (!fullText) return "";
-
-  let text = fullText;
-
-  // Optional: cut off "Links:" / "Resources:" section so it doesn't read URLs
-  const cutIndex = text.search(/(links:|resources:)/i);
-  if (cutIndex !== -1) {
-    text = text.slice(0, cutIndex);
+function base64FromArrayBuffer(ab) {
+  let binary = "";
+  const bytes = new Uint8Array(ab);
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
   }
-
-  // Remove markdown symbols (*, _, `, #, -, > etc)
-  text = text.replace(/[*_`>#\-]+/g, " ");
-
-  // Fix some pronunciations (example: Excel)
-  text = text.replace(/\bExcel\b/gi, "Microsoft Excel");
-
-  // Collapse extra spaces
-  text = text.replace(/\s{2,}/g, " ");
-
-  return text.trim();
+  return btoa(binary);
 }
 
-function pickNiceVoice() {
-  const allVoices = window.speechSynthesis.getVoices();
-  if (!allVoices || !allVoices.length) return null;
-
-  // Prefer Google voices if available (often more natural)
-  const googleVoice =
-    allVoices.find((v) =>
-      /Google US English|Google UK English/i.test(v.name)
-    ) || allVoices.find((v) => /Google/i.test(v.name));
-
-  return googleVoice || allVoices[0];
+function arrayBufferFromBase64(b64) {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
 }
 
-function speakText(fullText) {
-  if (!("speechSynthesis" in window)) {
-    log("Browser does not support speech synthesis (TTS).", true);
-    return;
+function floatTo16BitPCM(float32) {
+  const out = new Int16Array(float32.length);
+  for (let i = 0; i < float32.length; i++) {
+    let s = Math.max(-1, Math.min(1, float32[i]));
+    out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
   }
+  return out;
+}
 
-  const spoken = sanitizeForSpeech(fullText);
-  if (!spoken) return;
+function downsampleBuffer(buffer, sampleRate, outRate = 16000) {
+  if (outRate === sampleRate) return buffer;
+  const ratio = sampleRate / outRate;
+  const newLen = Math.round(buffer.length / ratio);
+  const result = new Float32Array(newLen);
+  let offset = 0;
+  for (let i = 0; i < newLen; i++) {
+    const nextOffset = Math.round((i + 1) * ratio);
+    let sum = 0,
+      count = 0;
+    for (let j = offset; j < nextOffset && j < buffer.length; j++) {
+      sum += buffer[j];
+      count++;
+    }
+    result[i] = sum / count;
+    offset = nextOffset;
+  }
+  return result;
+}
 
-  // Cancel any current speech
-  window.speechSynthesis.cancel();
+// ================= MIC CAPTURE =================
 
-  const utterance = new SpeechSynthesisUtterance(spoken);
+async function startMic() {
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
 
-  // Slightly slower, normal pitch
-  utterance.rate = 0.95;
-  utterance.pitch = 1.0;
+    const source = audioCtx.createMediaStreamSource(micStream);
+    processor = audioCtx.createScriptProcessor(4096, 1, 1);
 
-  if (voicesLoaded) {
-    const voice = pickNiceVoice();
-    if (voice) utterance.voice = voice;
-  } else {
-    window.speechSynthesis.onvoiceschanged = () => {
-      voicesLoaded = true;
-      const voice = pickNiceVoice();
-      if (voice) utterance.voice = voice;
+    source.connect(processor);
+    processor.connect(audioCtx.destination);
+
+    processor.onaudioprocess = (e) => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const input = e.inputBuffer.getChannelData(0);
+      const down = downsampleBuffer(input, audioCtx.sampleRate, 16000);
+      const pcm16 = floatTo16BitPCM(down);
+      const buffer = pcm16.buffer;
+
+      ws.send(
+        JSON.stringify({
+          type: "audio",
+          data: base64FromArrayBuffer(buffer),
+        })
+      );
     };
+
+    log("Microphone started");
+  } catch (err) {
+    log("Mic error: " + err.message, true);
+  }
+}
+
+function stopMic() {
+  if (processor) {
+    processor.disconnect();
+    processor = null;
+  }
+  if (micStream) {
+    micStream.getTracks().forEach((t) => t.stop());
+    micStream = null;
+  }
+  if (audioCtx && audioCtx.state !== "closed") {
+    audioCtx.close();
+    audioCtx = null;
+  }
+  log("Microphone stopped");
+}
+
+// ================= PLAYBACK OF GEMINI AUDIO =================
+
+function playPcm16(base64Pcm) {
+  if (!audioCtx) {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
   }
 
-  utterance.onstart = () => {
+  try {
+    const ab = arrayBufferFromBase64(base64Pcm);
+    const pcm16 = new Int16Array(ab);
+    const float32 = new Float32Array(pcm16.length);
+    for (let i = 0; i < pcm16.length; i++) {
+      float32[i] = pcm16[i] / 0x8000;
+    }
+
+    const buf = audioCtx.createBuffer(1, float32.length, 16000);
+    buf.copyToChannel(float32, 0);
+
+    const src = audioCtx.createBufferSource();
+    src.buffer = buf;
+    src.connect(audioCtx.destination);
+
+    const now = audioCtx.currentTime;
+    if (playTime < now) playTime = now;
+    src.start(playTime);
+    playTime += buf.duration;
+
     speakingIndicator.classList.remove("hidden");
-    currentTtsText = spoken.toLowerCase();
-  };
-
-  utterance.onend = () => {
-    speakingIndicator.classList.add("hidden");
-    currentTtsText = "";
-  };
-
-  utterance.onerror = (e) => {
-    log("TTS error: " + e.error, true);
-    speakingIndicator.classList.add("hidden");
-    currentTtsText = "";
-  };
-
-  window.speechSynthesis.speak(utterance);
-}
-
-// ================= STT: LISTENING =================
-
-function initSTT() {
-  const SpeechRecognition =
-    window.SpeechRecognition || window.webkitSpeechRecognition;
-  if (!SpeechRecognition) {
-    log(
-      "Browser does not support SpeechRecognition (STT). Use Chrome-based browser.",
-      true
-    );
-    return;
-  }
-
-  recognition = new SpeechRecognition();
-  recognition.lang = "en-US";
-  recognition.continuous = true;
-  recognition.interimResults = false;
-
-  recognition.onstart = () => {
-    recognizing = true;
-    log("Listening...");
-  };
-
-  recognition.onresult = (event) => {
-    for (let i = event.resultIndex; i < event.results.length; i++) {
-      const result = event.results[i];
-      if (!result.isFinal) continue;
-
-      const transcript = result[0].transcript.trim();
-      if (!transcript) continue;
-
-      // ---- ECHO FILTER ----
-      const words = transcript.split(/\s+/);
-      if (
-        currentTtsText &&
-        words.length > 4 &&
-        currentTtsText.includes(transcript.toLowerCase())
-      ) {
-        console.log("Ignoring echo transcript:", transcript);
-        return;
-      }
-
-      // Real user speech:
-      handleUserUtterance(transcript);
-    }
-  };
-
-  recognition.onerror = (event) => {
-    if (event.error === "no-speech" || event.error === "network") {
-      console.log("STT benign error:", event.error);
-      if (shouldKeepListening) {
-        setTimeout(() => {
-          if (!recognizing) {
-            try {
-              recognition.start();
-            } catch (_) {}
-          }
-        }, 500);
-      }
-      return;
-    }
-    log("STT error: " + event.error, true);
-  };
-
-  recognition.onend = () => {
-    recognizing = false;
-    if (shouldKeepListening) {
-      setTimeout(() => {
-        try {
-          recognition.start();
-        } catch (_) {}
-      }, 400);
-    }
-  };
-}
-
-function startListening() {
-  if (!recognition) initSTT();
-  if (recognition && !recognizing) {
-    try {
-      recognition.start();
-    } catch (e) {
-      console.error(e);
-    }
+    src.onended = () => {
+      speakingIndicator.classList.add("hidden");
+    };
+  } catch (err) {
+    log("Playback error: " + err.message, true);
   }
 }
 
-function stopListening() {
-  shouldKeepListening = false;
-  if (recognition && recognizing) {
-    recognition.stop();
-  }
-}
-
-// ================= WS: TALKING TO BACKEND =================
-
-function makeRequestId() {
-  return (
-    Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8)
-  );
-}
-
-function sendUserTextOverWS(text) {
-  if (!ws || ws.readyState !== WebSocket.OPEN || !wsReady) {
-    log("WebSocket not ready; cannot send message.", true);
-    return;
-  }
-  const requestId = makeRequestId();
-  lastRequestId = requestId;
-  ws.send(
-    JSON.stringify({
-      type: "user_text",
-      text,
-      requestId,
-    })
-  );
-}
-
-function handleUserUtterance(transcript) {
-  log(`You: ${transcript}`);
-  addTranscriptLine("user", transcript);
-  conversationHistory.push({ role: "user", text: transcript });
-
-  // If AI is talking, interrupt it
-  if ("speechSynthesis" in window) {
-    window.speechSynthesis.cancel();
-  }
-  currentTtsText = "";
-  speakingIndicator.classList.add("hidden");
-
-  sendUserTextOverWS(transcript);
-}
-
-// ================= SESSION CONTROL =================
+// ================= WS SESSION CONTROL =================
 
 function startSession() {
   const email = emailInput.value.trim();
@@ -290,9 +205,7 @@ function startSession() {
 
   transcriptEl.textContent = "Transcript will appear here...";
   logsEl.textContent = "";
-  conversationHistory = [];
-  wsReady = false;
-  lastRequestId = null;
+  playTime = 0;
 
   emailInput.disabled = true;
   lmsKeyInput.disabled = true;
@@ -325,30 +238,23 @@ function startSession() {
     }
 
     if (msg.type === "ready") {
-      log("Session ready. Start speaking when you're ready.");
-      wsReady = true;
-      shouldKeepListening = true;
-      startListening();
-      // ❌ REMOVED: automatic intro prompt
+      log("Gemini session ready. Starting mic...");
+      startMic();
       return;
     }
 
-    if (msg.type === "assistant_text") {
-      // Ignore stale responses (from older interrupted requests)
-      if (
-        msg.requestId &&
-        lastRequestId &&
-        msg.requestId !== lastRequestId
-      ) {
-        console.log("Ignoring stale response:", msg.requestId);
-        return;
-      }
+    if (msg.type === "audio") {
+      playPcm16(msg.data);
+      return;
+    }
 
-      const aiText = msg.text || "";
-      log("Praxis replied.");
-      addTranscriptLine("assistant", aiText);
-      conversationHistory.push({ role: "assistant", text: aiText });
-      speakText(aiText);
+    if (msg.type === "text") {
+      addTranscriptLine("assistant", msg.text);
+      return;
+    }
+
+    if (msg.type === "turnComplete") {
+      // Turn ended; indicator is already handled by audio onended
       return;
     }
 
@@ -365,13 +271,7 @@ function startSession() {
 
   ws.onclose = () => {
     log("WebSocket closed.");
-    wsReady = false;
-    stopListening();
-
-    if ("speechSynthesis" in window) {
-      window.speechSynthesis.cancel();
-    }
-    currentTtsText = "";
+    stopMic();
     speakingIndicator.classList.add("hidden");
 
     emailInput.disabled = false;
@@ -382,20 +282,14 @@ function startSession() {
 }
 
 function stopSession() {
-  shouldKeepListening = false;
-  stopListening();
-
-  if ("speechSynthesis" in window) {
-    window.speechSynthesis.cancel();
-  }
-  currentTtsText = "";
-  speakingIndicator.classList.add("hidden");
+  stopMic();
 
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "stop" }));
     ws.close();
   }
 
+  speakingIndicator.classList.add("hidden");
   emailInput.disabled = false;
   lmsKeyInput.disabled = false;
   startBtn.disabled = false;
