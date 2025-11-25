@@ -313,7 +313,7 @@ function openGeminiLiveSocket({ systemInstruction, tools }) {
       setup: {
         model: LIVE_MODEL,
         generationConfig: {
-          responseModalities: ["AUDIO"],
+          responseModalities: ["AUDIO", "TEXT"],
           temperature: 0.4,
           maxOutputTokens: 512,
           speechConfig: {
@@ -390,7 +390,8 @@ wss.on("connection", (clientWs) => {
         geminiWs.on("message", async (data) => {
           let gm;
           try { gm = JSON.parse(data.toString()); } catch { return; }
-
+            
+            console.log("🔥 Gemini WS message:", JSON.stringify(gm));
           if (gm.setupComplete) {
             console.log("✅ Gemini setup complete");
             sendClient({ type: "ready", sessionId });

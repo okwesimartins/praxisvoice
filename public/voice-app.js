@@ -26,6 +26,7 @@ function log(message, isError = false) {
   logEntry.textContent = `[${timestamp}] ${message}`;
   logsEl.appendChild(logEntry);
   logsEl.scrollTop = logsEl.scrollHeight;
+  console.log(isError ? '[LOG:ERROR]' : '[LOG]', message);
 }
 
 // Audio encoding utilities
@@ -140,7 +141,6 @@ function playPcm16(base64Pcm) {
       float32[i] = pcm16[i] / 0x8000;
     }
 
-    // 1.2x faster playback
     const targetRate = 16000 * 1.2;
     const buf = audioCtx.createBuffer(1, float32.length, targetRate);
     buf.copyToChannel(float32, 0);
@@ -173,10 +173,13 @@ function handleStart() {
   transcriptEl.textContent = 'Transcript will appear here...';
   log('Connecting to backend...');
 
-  ws = new WebSocket(`${BACKEND_URL.replace('https://', 'wss://')}/ws`);
+  const wsUrl = `${BACKEND_URL.replace('https://', 'wss://')}/ws`;
+  console.log("🔌 Connecting to WS:", wsUrl);
+  ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {
     log('WebSocket connected');
+    console.log("📤 Sending start message");
     ws.send(JSON.stringify({
       type: "start",
       student_email: email,
@@ -185,7 +188,9 @@ function handleStart() {
   };
 
   ws.onmessage = async (e) => {
+    console.log("📥 Raw WS message:", e.data);
     const msg = JSON.parse(e.data);
+    console.log("📥 Parsed WS message:", msg);
 
     if (msg.type === "ready") {
       log('Gemini ready - starting mic...');
@@ -198,13 +203,20 @@ function handleStart() {
     }
 
     if (msg.type === "text") {
-      currentTranscript += msg.text;
+      console.log("📝 AI text chunk:", msg.text);
+      // Clear placeholder on first chunk
+      if (!currentTranscript || currentTranscript === 'Transcript will appear here...') {
+        currentTranscript = '';
+        transcriptEl.textContent = '';
+      }
+      currentTranscript += (currentTranscript ? ' ' : '') + msg.text;
       transcriptEl.textContent = currentTranscript;
       transcriptEl.scrollTop = transcriptEl.scrollHeight;
       log(`AI: ${msg.text}`);
     }
 
     if (msg.type === "audio") {
+      console.log("🔊 Received audio chunk");
       playPcm16(msg.data);
     }
 
@@ -217,7 +229,8 @@ function handleStart() {
     }
   };
 
-  ws.onerror = () => {
+  ws.onerror = (event) => {
+    console.error("WS error event:", event);
     log('WebSocket error', true);
   };
 
