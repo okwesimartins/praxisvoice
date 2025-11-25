@@ -1,8 +1,8 @@
 /**
- * server.js — Praxis Voice Backend (Gemini text + Google TTS + WebSocket)
- * - Express health + serves static frontend (optional)
- * - WS /ws: browser text <-> Gemini text API + Google Text-to-Speech
- * - Enforces LMS key + student course scope
+ * server.js — Praxis Voice Backend (HTTP + WebSocket, text-only Gemini)
+ * - Express health + serves static frontend (public/)
+ * - WS /ws: browser text <-> Gemini text API
+ * - Pluralcode student scope enforcement
  */
 
 if (process.env.NODE_ENV !== "production") {
@@ -13,10 +13,9 @@ const http = require("http");
 const express = require("express");
 const cors = require("cors");
 const path = require("path");
-const WebSocket = require("ws");
 const crypto = require("crypto");
 const { google } = require("googleapis");
-const textToSpeech = require("@google-cloud/text-to-speech");
+const WebSocket = require("ws");
 
 // ---- fetch polyfill (Node < 18) ----
 let fetchFn = global.fetch;
@@ -26,37 +25,34 @@ if (!fetchFn) {
 }
 const fetch = (...args) => fetchFn(...args);
 
-// Google TTS client (uses default credentials on Cloud Run)
-const ttsClient = new textToSpeech.TextToSpeechClient();
-
 // Crash logging so Cloud Run shows real reasons
-process.on("uncaughtException", (e) =>
-  console.error("UNCAUGHT_EXCEPTION", e)
-);
+process.on("uncaughtException", (e) => console.error("UNCAUGHT_EXCEPTION", e));
 process.on("unhandledRejection", (e) =>
   console.error("UNHANDLED_REJECTION", e)
 );
 
 // -----------------------------------------------------------------------------
-// EXPRESS APP (health + optional static frontend)
+// EXPRESS APP (health + static frontend)
 // -----------------------------------------------------------------------------
 const app = express();
 app.use(cors());
 app.use(express.json());
 
+// Health endpoints
 app.get("/", (req, res) =>
-  res.json({ status: "ok", service: "Praxis Voice (Gemini+TTS+WS)" })
+  res.json({ status: "ok", service: "Praxis Voice API (HTTP+WS)" })
 );
 app.get("/health", (req, res) => res.json({ status: "healthy" }));
 
-// Serve frontend (optional)
-app.use(express.static(path.join(__dirname, "public")));
+// Serve static frontend from /public
+const publicDir = path.join(__dirname, "public");
+app.use(express.static(publicDir));
 app.get("/voice", (req, res) => {
-  res.sendFile(path.join(__dirname, "public", "voice-app.html"));
+  res.sendFile(path.join(publicDir, "voice-app.html"));
 });
 
 // -----------------------------------------------------------------------------
-// Pluralcode scope enforcement
+// Pluralcode scope enforcement (same logic you already had)
 // -----------------------------------------------------------------------------
 const PLURALCODE_API_BASE =
   process.env.PLURALCODE_API_URL || "https://backend.pluralcode.institute";
@@ -221,28 +217,37 @@ function buildContextHeader(studentEmail, enrolledCourseNames, allowedPhrases) {
 Student Email: ${studentEmail}
 Enrolled Course(s): "${enrolledCourseNames}"
 [ALLOWED TOPICS SAMPLE] (truncated): ${sample}
-[POLICY]
-- Answer ONLY if the topic is within the student's curriculum/sandbox.
-- If out of scope, briefly say it's outside their program and offer 2–3 in-scope alternatives.
-- You are a calm, friendly MALE online tutor called Praxis.
-- Teach step by step, with concrete examples and short check-in questions.
-- Only sometimes offer a quiz, after several teaching turns, when it feels natural.
-- Before giving a quiz, ask the student if they'd LIKE a quiz. Only if they agree, send a quiz.
+[POLICY] Answer ONLY if the topic is within the student's curriculum/sandbox. If out of scope, say it's outside their program and offer 2–3 in-scope alternatives.
 
-QUIZ FORMAT (ONLY WHEN STUDENT AGREES)
-- When you give a multiple-choice quiz, append a line starting with:
-  QUIZ: {"question":"...","options":["A","B","C"],"correctIndex":1,"explanation":"..."}
-- The JSON must be valid, single-line, and only contain those fields.
-- Do NOT put markdown inside the JSON.
+[ROLE] You are a human-like male tutor called Praxis. Teach like a real instructor: explain step by step, check understanding, and keep a supportive tone.
 
-LINKS
-- When suggesting YouTube videos or articles, include full URLs in the TEXT so the UI can make previews.
-- Write links on their own lines when possible.
-- Avoid reading out full URLs in voice; just describe them verbally in natural language.`;
+[QUIZZES]
+- When it makes sense, you may suggest a short quiz (2–5 questions) to test understanding.
+- First, explain the concept in clear, simple paragraphs.
+- Then, if you choose to give a quiz, append it *after* your explanation in this exact format:
+
+[QUIZ_JSON_START]
+{"questions":[
+  {"q":"Question text 1","options":["Option A","Option B","Option C","Option D"],"answerIndex":1}
+]}
+[QUIZ_JSON_END]
+
+RULES FOR QUIZ JSON:
+- Valid JSON only (no comments, no //, no trailing commas).
+- "questions" is an array.
+- Each question has:
+  - "q": the question text (no markdown, no bullet symbols).
+  - "options": 2–5 short options as strings.
+  - "answerIndex": the 0-based index of the correct option.
+
+[FORMATTING]
+- In normal explanations, avoid markdown syntax like *, #, backticks, or code fences.
+- Do NOT include code or comment markers like // or /* */ unless the student explicitly asks for code.
+- Use plain sentences and if you need lists, prefer "1)", "2)" style, not bullets.`;
 }
 
 // -----------------------------------------------------------------------------
-// (Optional) Google search helpers (not wired as tools here)
+// (Optional) Google search tools – still here if you want later
 // -----------------------------------------------------------------------------
 const Google_Search_API_KEY = process.env.Google_Search_API_KEY;
 const Google_Search_CX_ID = process.env.Google_Search_CX_ID;
@@ -332,7 +337,7 @@ async function search_web_for_articles({ query }) {
 }
 
 // -----------------------------------------------------------------------------
-// Gemini text API
+// Gemini text API (HTTP)
 // -----------------------------------------------------------------------------
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 if (!GEMINI_API_KEY) {
@@ -345,17 +350,16 @@ const GEMINI_MODEL = RAW_MODEL.startsWith("models/")
   : `models/${RAW_MODEL}`;
 
 const BASE_SYSTEM_INSTRUCTION = `
-You are Praxis, a specialized MALE AI tutor for Pluralcode Academy.
+You are Praxis, a specialized AI tutor for Pluralcode Academy.
 
 PLURALCODE KNOWLEDGE BASE (MANDATORY USAGE)
 - Official brand/site info: https://pluralcode.academy.
 - Course structure/modules/details must use official Pluralcode curriculum PDFs.
 CORE RULES
 1) Stay strictly within the student's enrolled course scope; sandbox topics are always allowed.
-2) Explain in a patient, teacher-like way, with concrete examples and short check-in questions.
+2) If out of scope, say so briefly and offer 2–3 in-scope alternatives.
 3) Prefer authoritative sources when suggesting external resources.
 4) Include links in text when appropriate (YouTube, documentation, articles). Do not read out full URLs; summarize verbally instead.
-5) Only occasionally offer a quiz, after some teaching and only if the student agrees. Do NOT include QUIZ JSON in every answer. 
 `;
 
 /**
@@ -384,9 +388,7 @@ async function callGeminiChat({ systemInstruction, contents }) {
 
   const res = await fetch(url, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
 
@@ -405,80 +407,7 @@ async function callGeminiChat({ systemInstruction, contents }) {
 }
 
 // -----------------------------------------------------------------------------
-// GOOGLE TTS — sanitize + synthesize
-// -----------------------------------------------------------------------------
-
-function sanitizeForSpeech(text) {
-  if (!text) return "";
-
-  let t = text;
-
-  // Remove QUIZ JSON so it doesn't read out raw JSON
-  t = t.replace(/QUIZ:\s*{[^}]*}/gi, " ");
-
-  // Cut off sections starting with "Links:" or "Resources:"
-  const cutIdx = t.search(/(links:|resources:)/i);
-  if (cutIdx !== -1) {
-    t = t.slice(0, cutIdx);
-  }
-
-  // Remove explicit URLs (http/https)
-  t = t.replace(/https?:\/\/\S+/gi, " ");
-
-  // Remove bare domains like example.com/path
-  t = t.replace(
-    /\b[^\s]+\.(com|net|org|io|ai|edu|co|dev|info)(\/[^\s]*)?/gi,
-    " "
-  );
-
-  // Remove "www." style hosts
-  t = t.replace(/\bwww\.[^\s]+/gi, " ");
-
-  // Remove inline code and markdown-ish symbols
-  t = t.replace(/`[^`]*`/g, " "); // code spans
-  t = t.replace(/[*_>#\-]+/g, " "); // bullets, markdown
-  t = t.replace(/[•~_=^]+/g, " "); // bullets and decorations
-
-  // Remove brackets, slashes, pipes
-  t = t.replace(/[\[\]\(\)\{\}<>\/\\|]+/g, " ");
-
-  // Fix some pronunciations
-  t = t.replace(/\bExcel\b/gi, "Microsoft Excel");
-
-  // Collapse extra whitespace
-  t = t.replace(/\s{2,}/g, " ");
-
-  return t.trim();
-}
-
-async function synthesizeWithGoogleTTS(fullText) {
-  const spoken = sanitizeForSpeech(fullText);
-  if (!spoken) return null;
-
-  const request = {
-    input: { text: spoken },
-    voice: {
-      languageCode: "en-US",
-      name: "en-US-Neural2-J", // male, natural neural voice
-      ssmlGender: "MALE",
-    },
-    audioConfig: {
-      audioEncoding: "MP3",
-      speakingRate: 0.95, // slightly slower for teaching
-    },
-  };
-
-  const [response] = await ttsClient.synthesizeSpeech(request);
-  if (!response.audioContent) return null;
-  const audioBase64 = response.audioContent.toString("base64");
-  return {
-    audioBase64,
-    mimeType: "audio/mpeg",
-  };
-}
-
-// -----------------------------------------------------------------------------
-// Optional HTTP /api/chat for non-WS clients
+// POST /api/chat  (kept for non-WS clients)
 // -----------------------------------------------------------------------------
 app.post("/api/chat", async (req, res) => {
   try {
@@ -538,7 +467,7 @@ app.post("/api/chat", async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// WebSocket /ws — text chat for voice UI (with TTS audio)
+// WebSocket /ws — text chat for voice UI (browser STT + TTS)
 // -----------------------------------------------------------------------------
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/ws" });
@@ -561,14 +490,6 @@ wss.on("connection", (ws) => {
     // ----- START SESSION -----
     if (msg.type === "start") {
       try {
-        if (msg.lmsKey && msg.lmsKey !== process.env.MY_LMS_API_KEY) {
-          ws.send(
-            JSON.stringify({ type: "error", error: "Invalid LMS key." })
-          );
-          ws.close();
-          return;
-        }
-
         const studentEmail = normalizeEmail(msg.student_email);
         const scope = await getStudentScope(studentEmail);
         const enrolledCourseNames = scope.courseNames.join(", ");
@@ -617,6 +538,19 @@ wss.on("connection", (ws) => {
       const text = String(msg.text || "").trim();
       if (!text) return;
 
+      if (
+        ws.session.lmsKey &&
+        ws.session.lmsKey !== process.env.MY_LMS_API_KEY
+      ) {
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            error: "Invalid LMS key.",
+          })
+        );
+        return;
+      }
+
       const requestId = msg.requestId || crypto.randomUUID();
 
       ws.session.history.push({ role: "user", text });
@@ -634,24 +568,13 @@ wss.on("connection", (ws) => {
 
         ws.session.history.push({ role: "assistant", text: aiText });
 
-        let tts = null;
-        try {
-          tts = await synthesizeWithGoogleTTS(aiText);
-        } catch (ttsErr) {
-          console.error("Google TTS error:", ttsErr);
-        }
-
-        const payload = {
-          type: "assistant_text",
-          text: aiText,
-          requestId,
-        };
-        if (tts && tts.audioBase64) {
-          payload.audio = tts.audioBase64;
-          payload.audioMime = tts.mimeType;
-        }
-
-        ws.send(JSON.stringify(payload));
+        ws.send(
+          JSON.stringify({
+            type: "assistant_text",
+            text: aiText,
+            requestId,
+          })
+        );
       } catch (err) {
         console.error("WS chat error:", err);
         ws.send(
@@ -686,6 +609,6 @@ wss.on("connection", (ws) => {
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, "0.0.0.0", () =>
   console.log(
-    `🚀 Praxis Voice (Gemini+TTS+WS) listening on ${PORT}, model=${GEMINI_MODEL}`
+    `🚀 Praxis Voice HTTP+WS listening on ${PORT}, model=${GEMINI_MODEL}`
   )
 );
