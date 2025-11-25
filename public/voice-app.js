@@ -1,72 +1,64 @@
 // ================= CONFIG =================
 
-// WebSocket URL (same origin as server.js)
 const WS_URL =
-  (location.protocol === "https:" ? "wss://" : "ws://") +
-  location.host +
-  "/ws";
+  (location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws";
 
 // ================= DOM ELEMENTS =================
 
 const emailInput = document.getElementById("email");
 const lmsKeyInput = document.getElementById("lmsKey");
 const startBtn = document.getElementById("startBtn");
-const stopBtn = document.getElementById("stopBtn");
 const talkBtn = document.getElementById("talkBtn");
+const stopBtn = document.getElementById("stopBtn");
 const transcriptEl = document.getElementById("transcript");
 const logsEl = document.getElementById("logs");
 const speakingIndicator = document.getElementById("speakingIndicator");
-
-const resourcesEl = document.getElementById("resources");
-const quizContainer = document.getElementById("quizContainer");
+const quizArea = document.getElementById("quizArea");
+const quizScoreEl = document.getElementById("quizScore");
 
 // ================= STATE =================
 
 let ws = null;
 let wsReady = false;
-let sessionActive = false;
 
 let recognition = null;
-let recognizing = false;
+let isListening = false;
+let talkModeActive = false;
 
-let voicesLoaded = false;
-let isSpeaking = false;
+let currentAudio = null;
 let conversationHistory = [];
+
 let lastRequestId = null;
+
+// Quiz score
+let quizCorrect = 0;
+let quizTotal = 0;
 
 // ================= UTIL: LOGGING =================
 
-function log(message, isError = false) {
+function log(msg, isError = false) {
   const timestamp = new Date().toLocaleTimeString();
   const div = document.createElement("div");
   div.className = "log-entry" + (isError ? " error" : "");
-  div.textContent = `[${timestamp}] ${message}`;
+  div.textContent = `[${timestamp}] ${msg}`;
   logsEl.appendChild(div);
   logsEl.scrollTop = logsEl.scrollHeight;
-  console[isError ? "error" : "log"](message);
+  console[isError ? "error" : "log"](msg);
 }
 
-// ================= UI HELPERS =================
-
-function setUiState() {
-  emailInput.disabled = sessionActive;
-  lmsKeyInput.disabled = sessionActive;
-
-  startBtn.disabled = sessionActive;
-  stopBtn.disabled = !sessionActive;
-
-  // Talk is only enabled when session is active, WS ready, and not currently listening
-  talkBtn.disabled = !sessionActive || !wsReady || recognizing;
-}
+// ================= UTIL: TRANSCRIPT UI =================
 
 function clearTranscriptIfPlaceholder() {
-  if (transcriptEl.textContent.trim() === "Transcript will appear here...") {
+  if (
+    transcriptEl.textContent.trim() === "Transcript will appear here..."
+  ) {
     transcriptEl.innerHTML = "";
   }
 }
 
 function addTranscriptLine(role, text) {
   clearTranscriptIfPlaceholder();
+  if (!text) return;
   const line = document.createElement("div");
   line.className = "transcript-line " + role; // "user" or "assistant"
   line.textContent = (role === "user" ? "You: " : "Praxis: ") + text;
@@ -74,109 +66,27 @@ function addTranscriptLine(role, text) {
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
-// ================= QUIZ HELPERS =================
+// ================= YOUTUBE PREVIEW =================
 
-function extractQuizDefinition(fullText) {
-  const match = fullText.match(
-    /\[QUIZ_JSON_START\]([\s\S]+?)\[QUIZ_JSON_END\]/
-  );
-  if (!match) return null;
-  try {
-    const json = match[1].trim();
-    const quiz = JSON.parse(json);
-    if (!quiz || !Array.isArray(quiz.questions)) return null;
-    return quiz;
-  } catch (e) {
-    console.error("Failed to parse quiz JSON:", e);
-    return null;
+function extractYoutubeLinks(text) {
+  const links = [];
+  const urlRegex = /(https?:\/\/[^\s)]+)/g;
+  let match;
+  while ((match = urlRegex.exec(text)) !== null) {
+    let url = match[1];
+    url = url.replace(/[),.]+$/, "");
+    if (url.includes("youtube.com/watch") || url.includes("youtu.be")) {
+      links.push(url);
+    }
   }
+  return links;
 }
 
-function stripQuizJson(fullText) {
-  return fullText
-    .replace(/\[QUIZ_JSON_START\][\s\S]+?\[QUIZ_JSON_END\]/, "")
-    .trim();
-}
-
-function renderQuiz(quizDef) {
-  quizContainer.innerHTML = "";
-
-  if (!quizDef || !Array.isArray(quizDef.questions) || !quizDef.questions.length) {
-    const p = document.createElement("p");
-    p.textContent = "Quiz format error. Try asking Praxis for another quiz.";
-    quizContainer.appendChild(p);
-    return;
-  }
-
-  const intro = document.createElement("p");
-  intro.textContent = "Quiz loaded. Answer the questions and click Submit to see your score.";
-  quizContainer.appendChild(intro);
-
-  quizDef.questions.forEach((q, idx) => {
-    const qDiv = document.createElement("div");
-    qDiv.className = "quiz-question";
-
-    const qText = document.createElement("p");
-    qText.textContent = `${idx + 1}. ${q.q}`;
-    qDiv.appendChild(qText);
-
-    if (!Array.isArray(q.options)) q.options = [];
-
-    q.options.forEach((opt, optIdx) => {
-      const label = document.createElement("label");
-      label.className = "quiz-option";
-
-      const radio = document.createElement("input");
-      radio.type = "radio";
-      radio.name = `quiz_q_${idx}`;
-      radio.value = String(optIdx);
-
-      label.appendChild(radio);
-      label.appendChild(document.createTextNode(" " + opt));
-      qDiv.appendChild(label);
-    });
-
-    quizContainer.appendChild(qDiv);
-  });
-
-  const submitBtn = document.createElement("button");
-  submitBtn.textContent = "Submit Quiz";
-  submitBtn.className = "btn btn-primary quiz-submit-btn";
-
-  const resultP = document.createElement("p");
-  resultP.className = "quiz-result";
-
-  submitBtn.addEventListener("click", () => {
-    let correct = 0;
-    const total = quizDef.questions.length;
-
-    quizDef.questions.forEach((q, idx) => {
-      const selected = quizContainer.querySelector(
-        `input[name="quiz_q_${idx}"]:checked`
-      );
-      if (!selected) return;
-      const chosen = Number(selected.value);
-      if (Number(q.answerIndex) === chosen) correct++;
-    });
-
-    resultP.textContent = `You scored ${correct} out of ${total}.`;
-  });
-
-  quizContainer.appendChild(submitBtn);
-  quizContainer.appendChild(resultP);
-}
-
-// ================= RESOURCES / YOUTUBE =================
-
-function extractLinks(text) {
-  return text.match(/https?:\/\/\S+/gi) || [];
-}
-
-function extractYouTubeId(url) {
+function getYouTubeIdFromUrl(url) {
   try {
     const u = new URL(url);
     if (u.hostname.includes("youtu.be")) {
-      return u.pathname.replace("/", "");
+      return u.pathname.slice(1);
     }
     if (u.hostname.includes("youtube.com")) {
       return u.searchParams.get("v");
@@ -187,227 +97,270 @@ function extractYouTubeId(url) {
   return null;
 }
 
-function renderResourcesFromText(text) {
-  const links = extractLinks(text);
-  if (!links.length) return;
+function renderYoutubePreview(url) {
+  const videoId = getYouTubeIdFromUrl(url);
+  if (!videoId) return;
+  const card = document.createElement("div");
+  card.className = "yt-card";
+  card.innerHTML = `
+    <a href="${url}" target="_blank" rel="noopener noreferrer" class="yt-thumb-link">
+      <img src="https://img.youtube.com/vi/${videoId}/hqdefault.jpg" class="yt-thumb" alt="YouTube thumbnail" />
+      <div class="yt-meta">
+        <div class="yt-title">YouTube video</div>
+        <div class="yt-url">${url}</div>
+      </div>
+    </a>
+  `;
+  transcriptEl.appendChild(card);
+  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+}
 
-  // Remove placeholder if it's still there
-  const placeholder = resourcesEl.querySelector(".placeholder");
-  if (placeholder) {
-    placeholder.remove();
+// ================= QUIZ PARSING & RENDER =================
+
+function extractQuizzesFromText(text) {
+  const quizzes = [];
+  if (!text) return { cleanText: text, quizzes };
+
+  let cleanText = text;
+  const regex = /QUIZ:\s*({[^}]*})/gi;
+  let match;
+
+  while ((match = regex.exec(text)) !== null) {
+    const jsonStr = match[1];
+    try {
+      const quiz = JSON.parse(jsonStr);
+      if (
+        quiz &&
+        typeof quiz.question === "string" &&
+        Array.isArray(quiz.options) &&
+        typeof quiz.correctIndex === "number"
+      ) {
+        quizzes.push(quiz);
+      }
+    } catch (e) {
+      console.warn("Failed to parse QUIZ JSON:", e);
+    }
   }
 
-  links.forEach((url) => {
-    const card = document.createElement("div");
-    card.className = "resource-card";
+  cleanText = cleanText.replace(/QUIZ:\s*{[^}]*}/gi, "").trim();
+  return { cleanText, quizzes };
+}
 
-    const linkEl = document.createElement("a");
-    linkEl.href = url;
-    linkEl.target = "_blank";
-    linkEl.rel = "noopener noreferrer";
-    linkEl.textContent = url;
-    card.appendChild(linkEl);
+function updateQuizScoreDisplay() {
+  if (quizTotal === 0) {
+    quizScoreEl.textContent = "No quizzes completed yet.";
+  } else {
+    quizScoreEl.textContent = `Score: ${quizCorrect}/${quizTotal} correct`;
+  }
+}
 
-    // If YouTube link, embed preview
-    if (/youtube\.com\/watch|youtu\.be\//i.test(url)) {
-      const videoId = extractYouTubeId(url);
-      if (videoId) {
-        const iframe = document.createElement("iframe");
-        iframe.src = `https://www.youtube.com/embed/${videoId}`;
-        iframe.allow =
-          "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture";
-        iframe.allowFullscreen = true;
-        iframe.loading = "lazy";
-        iframe.width = "100%";
-        iframe.height = "200";
-        card.appendChild(iframe);
-      }
+function renderQuiz(quiz) {
+  const card = document.createElement("div");
+  card.className = "quiz-card";
+
+  const questionEl = document.createElement("div");
+  questionEl.className = "quiz-question";
+  questionEl.textContent = quiz.question;
+  card.appendChild(questionEl);
+
+  const optionsWrap = document.createElement("div");
+  optionsWrap.className = "quiz-options";
+
+  const name = "quiz-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+
+  quiz.options.forEach((opt, idx) => {
+    const optId = `${name}-${idx}`;
+
+    const label = document.createElement("label");
+    label.className = "quiz-option";
+
+    const input = document.createElement("input");
+    input.type = "radio";
+    input.name = name;
+    input.value = idx;
+    input.id = optId;
+
+    const span = document.createElement("span");
+    span.textContent = opt;
+
+    label.appendChild(input);
+    label.appendChild(span);
+    optionsWrap.appendChild(label);
+  });
+
+  card.appendChild(optionsWrap);
+
+  const submitBtn = document.createElement("button");
+  submitBtn.className = "btn btn-primary quiz-submit";
+  submitBtn.textContent = "Submit answer";
+
+  const feedbackEl = document.createElement("div");
+  feedbackEl.className = "quiz-feedback";
+
+  submitBtn.addEventListener("click", () => {
+    const selected = card.querySelector("input[type=radio]:checked");
+    if (!selected) {
+      feedbackEl.textContent = "Please choose an option.";
+      feedbackEl.classList.remove("correct", "incorrect");
+      return;
     }
 
-    resourcesEl.appendChild(card);
+    const chosenIndex = parseInt(selected.value, 10);
+    quizTotal += 1;
+    if (chosenIndex === quiz.correctIndex) {
+      quizCorrect += 1;
+      feedbackEl.textContent = "Correct! " + (quiz.explanation || "");
+      feedbackEl.classList.remove("incorrect");
+      feedbackEl.classList.add("correct");
+    } else {
+      const correctLabel = quiz.options[quiz.correctIndex] || "";
+      feedbackEl.textContent =
+        `Not quite. Correct answer: ${correctLabel}. ` +
+        (quiz.explanation || "");
+      feedbackEl.classList.remove("correct");
+      feedbackEl.classList.add("incorrect");
+    }
+    updateQuizScoreDisplay();
+    submitBtn.disabled = true;
   });
+
+  card.appendChild(submitBtn);
+  card.appendChild(feedbackEl);
+
+  quizArea.appendChild(card);
+  updateQuizScoreDisplay();
 }
 
-// ================= TTS: SPEECH SYNTHESIS =================
+// ================= AUDIO PLAYBACK (Google TTS MP3) =================
 
-function sanitizeForSpeech(fullText) {
-  if (!fullText) return "";
-
-  let text = fullText;
-
-  // Remove any quiz JSON if somehow still present
-  text = stripQuizJson(text);
-
-  // Strip markdown bullets / formatting symbols
-  text = text.replace(/[*_`>#]+/g, " ");
-
-  // Remove comment-like slashes and bracket-ish characters
-  text = text.replace(/\/\/+/g, " ");
-  text = text.replace(/[{}\[\]()/\\|~^]+/g, " ");
-
-  // Try to drop "Links:" / "Resources:" sections from speech
-  const linksIndex = text.search(/(links:|resources:)/i);
-  if (linksIndex !== -1) {
-    text = text.slice(0, linksIndex);
+function stopCurrentAudio() {
+  if (currentAudio) {
+    currentAudio.pause();
+    currentAudio.currentTime = 0;
+    currentAudio = null;
   }
-
-  // Remove raw URLs so browser doesn't read "https colon slash slash..."
-  text = text.replace(/https?:\/\/\S+/gi, " ");
-
-  // Fix some pronunciations
-  text = text.replace(/\bExcel\b/gi, "Microsoft Excel");
-
-  // Collapse multiple spaces
-  text = text.replace(/\s{2,}/g, " ");
-
-  return text.trim();
+  speakingIndicator.classList.add("hidden");
 }
 
-function pickNiceVoice() {
-  const allVoices = window.speechSynthesis.getVoices();
-  if (!allVoices || !allVoices.length) return null;
+function playAssistantAudio(base64Audio, mimeType) {
+  stopCurrentAudio();
+  if (!base64Audio) return;
 
-  // Try to bias towards male-ish voices by name
-  const preferredNamePatterns = [
-    /male/i,
-    /\bDavid\b/i,
-    /\bDaniel\b/i,
-    /\bAlex\b/i,
-    /\bGeorge\b/i,
-    /\bTom\b/i,
-  ];
+  try {
+    const src = `data:${mimeType || "audio/mpeg"};base64,${base64Audio}`;
+    const audio = new Audio(src);
+    currentAudio = audio;
 
-  let preferred = allVoices.find((v) =>
-    preferredNamePatterns.some((rx) => rx.test(v.name))
-  );
-
-  if (!preferred) {
-    preferred =
-      allVoices.find((v) => /Google US English\b/i.test(v.name)) ||
-      allVoices.find((v) => /Google UK English\b/i.test(v.name)) ||
-      allVoices.find((v) => /Google/i.test(v.name));
-  }
-
-  return preferred || allVoices[0];
-}
-
-function speakText(fullText) {
-  if (!("speechSynthesis" in window)) {
-    log("Browser does not support speech synthesis (TTS).", true);
-    return;
-  }
-
-  const spoken = sanitizeForSpeech(fullText);
-  if (!spoken) return;
-
-  // Cancel any current speech
-  window.speechSynthesis.cancel();
-
-  const utterance = new SpeechSynthesisUtterance(spoken);
-
-  // Slightly slower, normal pitch
-  utterance.rate = 0.9;
-  utterance.pitch = 1.0;
-
-  if (voicesLoaded) {
-    const voice = pickNiceVoice();
-    if (voice) utterance.voice = voice;
-  } else {
-    window.speechSynthesis.onvoiceschanged = () => {
-      voicesLoaded = true;
-      const voice = pickNiceVoice();
-      if (voice) utterance.voice = voice;
+    audio.onplay = () => {
+      speakingIndicator.classList.remove("hidden");
     };
+
+    audio.onended = () => {
+      speakingIndicator.classList.add("hidden");
+      currentAudio = null;
+    };
+
+    audio.onerror = (e) => {
+      console.error("Audio playback error:", e);
+      speakingIndicator.classList.add("hidden");
+      currentAudio = null;
+    };
+
+    audio.play().catch((err) => {
+      console.error("Audio play() failed:", err);
+      speakingIndicator.classList.add("hidden");
+      currentAudio = null;
+    });
+  } catch (e) {
+    console.error("Failed to create audio element:", e);
   }
-
-  utterance.onstart = () => {
-    isSpeaking = true;
-    speakingIndicator.classList.remove("hidden");
-  };
-
-  utterance.onend = () => {
-    isSpeaking = false;
-    speakingIndicator.classList.add("hidden");
-    setUiState();
-  };
-
-  utterance.onerror = (e) => {
-    log("TTS error: " + e.error, true);
-    isSpeaking = false;
-    speakingIndicator.classList.add("hidden");
-    setUiState();
-  };
-
-  window.speechSynthesis.speak(utterance);
 }
 
-// ================= STT: SPEECH RECOGNITION =================
+// ================= STT: LISTENING (talkMode stays on) =================
 
 function initSTT() {
   const SpeechRecognition =
     window.SpeechRecognition || window.webkitSpeechRecognition;
-
   if (!SpeechRecognition) {
     log(
-      "Browser does not support SpeechRecognition (STT). Use a recent Chrome-based browser.",
+      "Browser does not support SpeechRecognition (STT). Use Chrome-based browser.",
       true
     );
-    return;
+    return null;
   }
 
-  recognition = new SpeechRecognition();
-  recognition.lang = "en-US";
-  recognition.continuous = false;      // one utterance per click
-  recognition.interimResults = false;  // only final result
+  const rec = new SpeechRecognition();
+  rec.lang = "en-US";
+  rec.continuous = true;        // keep stream open
+  rec.interimResults = false;   // only final results
 
-  recognition.onstart = () => {
-    recognizing = true;
-    log("Listening...");
-    setUiState();
+  rec.onstart = () => {
+    isListening = true;
+    log("Listening for your question...");
+    talkBtn.classList.add("listening");
+    talkBtn.textContent = "Stop Listening";
   };
 
-  recognition.onresult = (event) => {
-    const result = event.results[0];
-    if (!result) return;
-    const transcript = (result[0] && result[0].transcript || "").trim();
-    if (!transcript) return;
-
-    handleUserUtterance(transcript);
-  };
-
-  recognition.onerror = (event) => {
-    if (event.error === "no-speech") {
-      log("No speech detected.", false);
-    } else {
-      log("STT error: " + event.error, true);
+  rec.onresult = (event) => {
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const result = event.results[i];
+      if (!result.isFinal) continue;
+      const transcript = (result[0] && result[0].transcript) || "";
+      const text = transcript.trim();
+      if (!text) continue;
+      handleUserUtterance(text);
     }
   };
 
-  recognition.onend = () => {
-    recognizing = false;
-    log("Stopped listening.");
-    setUiState();
+  rec.onerror = (event) => {
+    console.error("STT error:", event);
+    // If it's no-speech or network, and talk mode is active, just restart
+    if (event.error === "no-speech" || event.error === "network") {
+      if (talkModeActive) {
+        setTimeout(() => {
+          if (!isListening) {
+            try {
+              rec.start();
+            } catch (_) {}
+          }
+        }, 400);
+      }
+      return;
+    }
+    log("STT error: " + event.error, true);
   };
+
+  rec.onend = () => {
+    isListening = false;
+    // If talk mode is still active, restart listening so the mic stays open
+    if (talkModeActive) {
+      setTimeout(() => {
+        try {
+          rec.start();
+        } catch (e) {
+          console.error("STT restart error:", e);
+        }
+      }, 300);
+    } else {
+      talkBtn.classList.remove("listening");
+      talkBtn.textContent = "🎤 Talk to Praxis";
+    }
+  };
+
+  return rec;
 }
 
-function startListeningOnce() {
+function ensureSTTAndStart() {
   if (!recognition) {
-    initSTT();
+    recognition = initSTT();
   }
   if (!recognition) return;
 
-  // If Praxis is speaking, cancel the voice FIRST (manual barge-in via button)
-  if ("speechSynthesis" in window) {
-    window.speechSynthesis.cancel();
-  }
-  isSpeaking = false;
-  speakingIndicator.classList.add("hidden");
-
-  if (!recognizing) {
+  if (!isListening) {
     try {
       recognition.start();
     } catch (e) {
-      console.error(e);
+      console.error("recognition.start error:", e);
     }
   }
 }
@@ -441,6 +394,9 @@ function handleUserUtterance(transcript) {
   addTranscriptLine("user", transcript);
   conversationHistory.push({ role: "user", text: transcript });
 
+  // Once user talks, stop any current AI speech (manual barge-in)
+  stopCurrentAudio();
+
   sendUserTextOverWS(transcript);
 }
 
@@ -455,17 +411,23 @@ function startSession() {
 
   transcriptEl.textContent = "Transcript will appear here...";
   logsEl.textContent = "";
-  resourcesEl.innerHTML =
-    '<p class="placeholder">Links and YouTube previews will appear here when Praxis shares resources.</p>';
-  quizContainer.innerHTML =
-    '<p class="placeholder">No quiz yet. Ask Praxis to test you with a short quiz.</p>';
-
+  quizArea.innerHTML = "";
+  quizScoreEl.textContent = "";
+  quizCorrect = 0;
+  quizTotal = 0;
   conversationHistory = [];
   wsReady = false;
-  sessionActive = true;
   lastRequestId = null;
+  talkModeActive = false;
+  isListening = false;
 
-  setUiState();
+  emailInput.disabled = true;
+  lmsKeyInput.disabled = true;
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
+  talkBtn.disabled = true;
+  talkBtn.classList.remove("listening");
+  talkBtn.textContent = "🎤 Talk to Praxis";
 
   const lmsKey = lmsKeyInput.value.trim() || undefined;
 
@@ -493,46 +455,30 @@ function startSession() {
     }
 
     if (msg.type === "ready") {
-      log("Session ready.");
+      log("Session ready. You can now talk to Praxis.");
       wsReady = true;
-      setUiState();
-
-      // Optional: ask Praxis to introduce himself
-      const introPrompt =
-        "Introduce yourself as Praxis, my male online tutor at Pluralcode Academy, in 2-3 short spoken sentences. Do NOT use bullet points or markdown.";
-      const introId = "intro-" + makeRequestId();
-      lastRequestId = introId;
-      ws.send(
-        JSON.stringify({
-          type: "user_text",
-          text: introPrompt,
-          requestId: introId,
-        })
-      );
+      talkBtn.disabled = false;
       return;
     }
 
     if (msg.type === "assistant_text") {
-      const fullText = msg.text || "";
+      const aiText = msg.text || "";
+      log("Praxis replied.");
+      const { cleanText, quizzes } = extractQuizzesFromText(aiText);
 
-      // Extract quiz if present
-      const quizDef = extractQuizDefinition(fullText);
-      if (quizDef) {
-        renderQuiz(quizDef);
+      if (cleanText) {
+        addTranscriptLine("assistant", cleanText);
+        conversationHistory.push({ role: "assistant", text: cleanText });
+
+        const ytLinks = extractYoutubeLinks(cleanText);
+        ytLinks.forEach(renderYoutubePreview);
       }
 
-      // Strip quiz JSON for display & speech
-      const displayText = stripQuizJson(fullText);
+      quizzes.forEach(renderQuiz);
 
-      log("Praxis replied.");
-      addTranscriptLine("assistant", displayText);
-      conversationHistory.push({ role: "assistant", text: displayText });
-
-      // Render resources (YouTube previews, links)
-      renderResourcesFromText(displayText);
-
-      // Speak explanation only (no quiz / weird characters)
-      speakText(displayText);
+      if (msg.audio) {
+        playAssistantAudio(msg.audio, msg.audioMime);
+      }
       return;
     }
 
@@ -550,50 +496,85 @@ function startSession() {
   ws.onclose = () => {
     log("WebSocket closed.");
     wsReady = false;
-    sessionActive = false;
+    stopCurrentAudio();
 
-    if ("speechSynthesis" in window) {
-      window.speechSynthesis.cancel();
+    // Stop STT mode
+    talkModeActive = false;
+    if (recognition && isListening) {
+      recognition.stop();
     }
-    isSpeaking = false;
-    speakingIndicator.classList.add("hidden");
+    isListening = false;
+    talkBtn.classList.remove("listening");
+    talkBtn.textContent = "🎤 Talk to Praxis";
 
-    setUiState();
+    emailInput.disabled = false;
+    lmsKeyInput.disabled = false;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    talkBtn.disabled = true;
   };
 }
 
 function stopSession() {
-  if (recognition && recognizing) {
+  stopCurrentAudio();
+
+  talkModeActive = false;
+  if (recognition && isListening) {
     recognition.stop();
   }
-
-  if ("speechSynthesis" in window) {
-    window.speechSynthesis.cancel();
-  }
-  isSpeaking = false;
-  speakingIndicator.classList.add("hidden");
+  isListening = false;
+  talkBtn.classList.remove("listening");
+  talkBtn.textContent = "🎤 Talk to Praxis";
 
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "stop" }));
     ws.close();
   }
 
-  sessionActive = false;
-  wsReady = false;
-  setUiState();
+  emailInput.disabled = false;
+  lmsKeyInput.disabled = false;
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+  talkBtn.disabled = true;
 
   log("Session stopped.");
+}
+
+// ================= BUTTON HANDLERS =================
+
+function handleTalkClick() {
+  if (!wsReady) {
+    log("Session not ready yet.", true);
+    return;
+  }
+
+  // If AI is currently speaking, interrupt it first
+  if (currentAudio) {
+    stopCurrentAudio();
+  }
+
+  // Toggle talk mode
+  if (!talkModeActive) {
+    talkModeActive = true;
+    log("Listening mode ON. Speak whenever you're ready.");
+    ensureSTTAndStart();
+  } else {
+    talkModeActive = false;
+    log("Listening mode OFF.");
+    if (recognition && isListening) {
+      recognition.stop();
+    }
+    isListening = false;
+    talkBtn.classList.remove("listening");
+    talkBtn.textContent = "🎤 Talk to Praxis";
+  }
 }
 
 // ================= EVENT LISTENERS =================
 
 startBtn.addEventListener("click", startSession);
 stopBtn.addEventListener("click", stopSession);
-
-talkBtn.addEventListener("click", () => {
-  if (!sessionActive || !wsReady) return;
-  startListeningOnce();
-});
+talkBtn.addEventListener("click", handleTalkClick);
 
 window.addEventListener("beforeunload", () => {
   stopSession();
