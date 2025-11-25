@@ -1,8 +1,12 @@
-// If frontend is hosted on the same domain as the backend, leave this as "".
-// If hosted separately, you can set window.BACKEND_URL in HTML.
-const BACKEND_URL = window.BACKEND_URL || "";
+// =======================
+// CONFIG
+// =======================
+const API_BASE = ""; // "" = same origin as server.js. Or e.g. "https://your-backend-url"
+const CHAT_PATH = "/api/praxis/text"; // backend route that talks to Gemini
 
-// DOM elements
+// =======================
+// DOM ELEMENTS
+// =======================
 const emailInput = document.getElementById("email");
 const lmsKeyInput = document.getElementById("lmsKey");
 const startBtn = document.getElementById("startBtn");
@@ -11,123 +15,94 @@ const transcriptEl = document.getElementById("transcript");
 const logsEl = document.getElementById("logs");
 const speakingIndicator = document.getElementById("speakingIndicator");
 
-// State
-let sessionActive = false;
+// =======================
+// STATE
+// =======================
 let recognition = null;
-let isRecognizing = false;
-let currentTranscript = "";
-let conversationHistory = []; // { role: "user" | "assistant", text }
-let currentEmail = "";
-let currentLmsKey = "";
+let recognizing = false;
+let sessionActive = false;
 
-// Logging helper
+let selectedVoice = null;
+let isSending = false; // avoid overlapping requests
+let conversation = []; // simple array of {role, text}
+
+// =======================
+// LOGGING
+// =======================
 function log(message, isError = false) {
   const timestamp = new Date().toLocaleTimeString();
-  const div = document.createElement("div");
-  div.className = `log-entry${isError ? " error" : ""}`;
-  div.textContent = `[${timestamp}] ${message}`;
-  logsEl.appendChild(div);
+  const entry = document.createElement("div");
+  entry.className = `log-entry${isError ? " error" : ""}`;
+  entry.textContent = `[${timestamp}] ${message}`;
+  logsEl.appendChild(entry);
   logsEl.scrollTop = logsEl.scrollHeight;
-  console.log(isError ? "[LOG:ERROR]" : "[LOG]", message);
+  console[isError ? "error" : "log"]("[LOG]", message);
 }
 
-// Speech recognition setup
-const SpeechRecognition =
-  window.SpeechRecognition || window.webkitSpeechRecognition || null;
-
-if (!SpeechRecognition) {
-  log("Browser does not support Web Speech API (STT). Try Chrome.", true);
-}
-
-// Start listening to the user
-function startListening() {
-  if (!SpeechRecognition) {
-    log("SpeechRecognition not available in this browser.", true);
+// =======================
+// TRANSCRIPT UI
+// =======================
+function renderTranscript() {
+  if (!conversation.length) {
+    transcriptEl.textContent = "Transcript will appear here...";
     return;
   }
-  if (!sessionActive) return;
 
-  // Make sure we are not speaking
-  window.speechSynthesis.cancel();
-  speakingIndicator.classList.add("hidden");
+  transcriptEl.innerHTML = "";
+  conversation.forEach((turn) => {
+    const p = document.createElement("p");
+    p.className = `turn turn-${turn.role}`;
+    const label = turn.role === "user" ? "You" : "Praxis";
+    p.innerHTML = `<strong>${label}:</strong> ${turn.text}`;
+    transcriptEl.appendChild(p);
+  });
 
-  recognition = new SpeechRecognition();
-  recognition.lang = "en-US";
-  recognition.interimResults = true;
-  recognition.continuous = false;
-
-  isRecognizing = true;
-  recognition.start();
-  log("Listening for your question...");
-
-  let finalTranscript = "";
-
-  recognition.onresult = (event) => {
-    let interim = "";
-    for (let i = event.resultIndex; i < event.results.length; ++i) {
-      const result = event.results[i];
-      if (result.isFinal) {
-        finalTranscript += result[0].transcript;
-      } else {
-        interim += result[0].transcript;
-      }
-    }
-
-    if (interim) {
-      transcriptEl.textContent = `You (speaking...): ${interim}`;
-    }
-    if (finalTranscript) {
-      const text = finalTranscript.trim();
-      if (text) {
-        log(`You: ${text}`);
-        appendToTranscript("You", text);
-        conversationHistory.push({ role: "user", text });
-        // Stop listening and send to backend
-        isRecognizing = false;
-        recognition.stop();
-        sendToBackend(text);
-      }
-    }
-  };
-
-  recognition.onerror = (event) => {
-    log(`STT error: ${event.error}`, true);
-    isRecognizing = false;
-  };
-
-  recognition.onend = () => {
-    // If STT ended without capturing anything and session is active,
-    // just restart listening (idle / silence case).
-    if (sessionActive && !isRecognizing && conversationHistory.length === 0) {
-      // First time: user didn't say anything; try again.
-      setTimeout(() => startListening(), 300);
-    }
-  };
-}
-
-// Append a line to transcript UI
-function appendToTranscript(speaker, text) {
-  if (!currentTranscript || currentTranscript === "Transcript will appear here...") {
-    currentTranscript = "";
-    transcriptEl.textContent = "";
-  }
-  const line = `${speaker}: ${text}`;
-  currentTranscript += (currentTranscript ? "\n" : "") + line;
-  transcriptEl.textContent = currentTranscript;
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
-// Speak AI text using browser TTS
-function speakText(text) {
-  if (!sessionActive) return;
+// =======================
+// BROWSER TTS (SPEECHSYNTHESIS)
+// =======================
+function pickBestVoice() {
+  const voices = window.speechSynthesis.getVoices();
+  if (!voices || !voices.length) {
+    console.log("No TTS voices available (yet).");
+    return;
+  }
 
-  // Cancel any previous speech
+  console.log("Available voices:", voices);
+
+  selectedVoice =
+    voices.find((v) => /Google UK English Female/i.test(v.name)) ||
+    voices.find((v) => /Google US English/i.test(v.name)) ||
+    voices.find((v) => /Google English/i.test(v.name)) ||
+    voices.find((v) => v.lang === "en-US") ||
+    voices.find((v) => v.lang && v.lang.startsWith("en")) ||
+    voices[0];
+
+  console.log("Selected voice:", selectedVoice && selectedVoice.name);
+}
+
+// Load voices (async in some browsers)
+window.speechSynthesis.onvoiceschanged = pickBestVoice;
+pickBestVoice();
+
+// Speak AI text
+function speakText(text) {
+  if (!sessionActive || !text) return;
+
+  // Cancel any ongoing speech
   window.speechSynthesis.cancel();
 
   const utterance = new SpeechSynthesisUtterance(text);
-  // Slightly faster, slightly higher pitch to feel more "alive"
-  utterance.rate = 1.15;
-  utterance.pitch = 1.05;
+
+  if (selectedVoice) {
+    utterance.voice = selectedVoice;
+  }
+
+  // Tweak to sound less robotic
+  utterance.rate = 1.1;   // slightly faster
+  utterance.pitch = 1.05; // slightly brighter
   utterance.volume = 1.0;
 
   utterance.onstart = () => {
@@ -138,9 +113,9 @@ function speakText(text) {
   utterance.onend = () => {
     speakingIndicator.classList.add("hidden");
     log("Praxis finished speaking.");
+    // Go back to listening (barge-in style)
     if (sessionActive) {
-      // After AI finishes, listen again
-      setTimeout(() => startListening(), 300);
+      startListening();
     }
   };
 
@@ -148,54 +123,198 @@ function speakText(text) {
     speakingIndicator.classList.add("hidden");
     log(`TTS error: ${e.error}`, true);
     if (sessionActive) {
-      setTimeout(() => startListening(), 500);
+      startListening();
     }
   };
 
   window.speechSynthesis.speak(utterance);
 }
 
-// Call backend /api/chat with user text + history
-async function sendToBackend(userText) {
-  try {
-    log("Sending message to backend...");
-    const body = {
-      student_email: currentEmail,
-      lmsKey: currentLmsKey || undefined,
-      message: userText,
-      history: conversationHistory, // includes previous user + assistant turns
-    };
+// =======================
+// BROWSER STT (SPEECHRECOGNITION)
+// =======================
+function setupRecognition() {
+  const SpeechRecognition =
+    window.SpeechRecognition || window.webkitSpeechRecognition;
 
-    const url = `${BACKEND_URL}/api/chat`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
+  if (!SpeechRecognition) {
+    log("SpeechRecognition not supported in this browser.", true);
+    alert(
+      "Your browser does not support voice recognition. Please use Chrome or Edge."
+    );
+    return;
+  }
 
-    if (!res.ok) {
-      const errText = await res.text();
-      log(`Backend error: ${res.status} ${errText}`, true);
-      // Try listening again so user can retry
-      if (sessionActive) setTimeout(() => startListening(), 800);
-      return;
+  recognition = new SpeechRecognition();
+  recognition.lang = "en-US";
+  recognition.continuous = false; // single utterance per turn
+  recognition.interimResults = true; // show partials
+
+  recognition.onstart = () => {
+    recognizing = true;
+    log("Listening...");
+  };
+
+  recognition.onend = () => {
+    recognizing = false;
+    log("Stopped listening.");
+    // We don't restart here automatically; we restart after AI finishes talking
+  };
+
+  recognition.onerror = (event) => {
+    log(`STT error: ${event.error}`, true);
+    recognizing = false;
+    if (sessionActive && event.error !== "no-speech") {
+      setTimeout(() => startListening(), 800);
+    }
+  };
+
+  recognition.onresult = (event) => {
+    let finalText = "";
+    let interimText = "";
+
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const transcript = event.results[i][0].transcript.trim();
+      if (event.results[i].isFinal) {
+        finalText += transcript + " ";
+      } else {
+        interimText += transcript + " ";
+      }
     }
 
-    const data = await res.json();
-    const aiText = (data && data.text) || "(no response text)";
-    appendToTranscript("Praxis", aiText);
-    log(`Praxis: ${aiText}`);
-    conversationHistory.push({ role: "assistant", text: aiText });
+    // Show interim text live (as user speaks)
+    if (interimText) {
+      const tempConv = [...conversation, { role: "user", text: interimText }];
+      transcriptEl.innerHTML = "";
+      tempConv.forEach((turn) => {
+        const p = document.createElement("p");
+        p.className = `turn turn-${turn.role}`;
+        const label = turn.role === "user" ? "You" : "Praxis";
+        p.innerHTML = `<strong>${label}:</strong> ${turn.text}`;
+        transcriptEl.appendChild(p);
+      });
+      transcriptEl.scrollTop = transcriptEl.scrollHeight;
+    }
 
-    // Speak the AI reply
-    speakText(aiText);
-  } catch (err) {
-    log(`Request failed: ${err.message}`, true);
-    if (sessionActive) setTimeout(() => startListening(), 800);
+    // Once we get final text, send to backend
+    if (finalText.trim()) {
+      handleUserText(finalText.trim());
+    }
+  };
+}
+
+function startListening() {
+  if (!sessionActive) return;
+  if (!recognition) {
+    setupRecognition();
+  }
+  if (!recognition) return; // still unsupported
+
+  // If currently speaking, stop TTS and start listening
+  if (window.speechSynthesis.speaking) {
+    window.speechSynthesis.cancel();
+  }
+
+  try {
+    recognition.start();
+  } catch (e) {
+    // Ignore "already started" errors
+    console.log("Recognition start error:", e.message);
   }
 }
 
-// Start/stop handlers
+function stopListening() {
+  if (recognition && recognizing) {
+    recognition.stop();
+  }
+}
+
+// =======================
+// BACKEND CALL
+// =======================
+async function sendToBackend(text) {
+  const email = emailInput.value.trim();
+  const lmsKey = lmsKeyInput.value.trim() || undefined;
+
+  if (!email) {
+    log("Missing student email.", true);
+    return;
+  }
+
+  if (isSending) {
+    log("Still waiting for previous reply, skipping...", true);
+    return;
+  }
+
+  isSending = true;
+  log(`Sending to backend: "${text}"`);
+
+  try {
+    const res = await fetch(API_BASE + CHAT_PATH, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        text,
+        student_email: email,
+        lmsKey,
+      }),
+    });
+
+    if (!res.ok) {
+      const msg = await res.text();
+      throw new Error(`HTTP ${res.status}: ${msg}`);
+    }
+
+    const data = await res.json();
+
+    const replyText = data.reply || "(No reply text)";
+    log(`Praxis reply: ${replyText}`);
+
+    // Add AI reply to conversation
+    conversation.push({ role: "assistant", text: replyText });
+
+    // If backend also returns links (e.g. YouTube / articles), render them nicely
+    if (Array.isArray(data.links) && data.links.length) {
+      const linksText = data.links
+        .map((l, idx) => `${idx + 1}. ${l.title || l.link || ""}`)
+        .join("\n");
+      conversation.push({
+        role: "assistant",
+        text: `Here are some resources:\n${linksText}`,
+      });
+    }
+
+    renderTranscript();
+    speakText(replyText);
+  } catch (err) {
+    log(`Backend error: ${err.message}`, true);
+    if (sessionActive) {
+      // Try listening again
+      setTimeout(() => startListening(), 1000);
+    }
+  } finally {
+    isSending = false;
+  }
+}
+
+// When STT confirms user text
+function handleUserText(text) {
+  // Commit user text to conversation
+  conversation.push({ role: "user", text });
+  renderTranscript();
+
+  // Pause listening while we get + speak AI reply
+  stopListening();
+
+  // Ask backend
+  sendToBackend(text);
+}
+
+// =======================
+// SESSION CONTROL
+// =======================
 function handleStart() {
   const email = emailInput.value.trim();
   if (!email) {
@@ -203,52 +322,41 @@ function handleStart() {
     return;
   }
 
-  currentEmail = email;
-  currentLmsKey = lmsKeyInput.value.trim();
   sessionActive = true;
-  conversationHistory = [];
-  currentTranscript = "";
-  transcriptEl.textContent = "Transcript will appear here...";
-  logsEl.textContent = "";
-  log("Session started.");
+  conversation = [];
+  renderTranscript();
 
   startBtn.disabled = true;
   stopBtn.disabled = false;
   emailInput.disabled = true;
   lmsKeyInput.disabled = true;
 
-  // Start listening immediately
+  log("Session started. Say something!");
   startListening();
 }
 
 function handleStop() {
   sessionActive = false;
-  log("Stopping session...");
-
-  // Stop STT
-  try {
-    if (recognition) recognition.stop();
-  } catch (_) {}
-
-  // Stop TTS
+  stopListening();
   window.speechSynthesis.cancel();
-  speakingIndicator.classList.add("hidden");
 
   startBtn.disabled = false;
   stopBtn.disabled = true;
   emailInput.disabled = false;
   lmsKeyInput.disabled = false;
+
+  speakingIndicator.classList.add("hidden");
+  log("Session stopped.");
 }
 
-// Event listeners
+// =======================
+// EVENT LISTENERS
+// =======================
 startBtn.addEventListener("click", handleStart);
 stopBtn.addEventListener("click", handleStop);
 
-// Cleanup on page unload
 window.addEventListener("beforeunload", () => {
   sessionActive = false;
-  try {
-    if (recognition) recognition.stop();
-  } catch (_) {}
+  stopListening();
   window.speechSynthesis.cancel();
 });

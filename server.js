@@ -318,7 +318,7 @@ if (!GEMINI_API_KEY) {
   console.warn("⚠️ GEMINI_API_KEY not set in environment!");
 }
 
-const RAW_MODEL = process.env.GEMINI_MODEL || "models/gemini-2.5-pro";
+const RAW_MODEL = process.env.GEMINI_MODEL || "models/gemini-2.0-flash-exp";
 // Ensure format models/...
 const GEMINI_MODEL = RAW_MODEL.startsWith("models/")
   ? RAW_MODEL
