@@ -40,6 +40,9 @@ app.use(express.json());
 app.get("/", (req, res) => res.json({ status: "ok", service: "Praxis Voice API" }));
 app.get("/health", (req, res) => res.json({ status: "healthy" }));
 
+
+app.use(express.static(path.join(__dirname, 'public')));
+
 app.get("/voice", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "voice-app.html"));
 });
