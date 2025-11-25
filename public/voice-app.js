@@ -1,19 +1,13 @@
-// =======================
-// CONFIG
-// =======================
+// ================= CONFIG =================
 
-// If frontend is served by the same backend, leave API_BASE empty ("").
-// If hosted elsewhere, set it to your Cloud Run URL:
-// const API_BASE = "https://veritas-ai-voice-156084498565.europe-west1.run.app";
-const API_BASE = "";
+// Assuming frontend is served by the same server.js (same origin)
+const WS_URL =
+  (location.protocol === "https:" ? "wss://" : "ws://") +
+  location.host +
+  "/ws";
 
-// Build WS URL from API_BASE or current origin
-const WS_BASE = API_BASE || window.location.origin;
-const WS_URL = WS_BASE.replace(/^http/, "ws") + "/ws";
+// ================= DOM ELEMENTS =================
 
-// =======================
-// DOM ELEMENTS
-// =======================
 const emailInput = document.getElementById("email");
 const lmsKeyInput = document.getElementById("lmsKey");
 const startBtn = document.getElementById("startBtn");
@@ -22,287 +16,248 @@ const transcriptEl = document.getElementById("transcript");
 const logsEl = document.getElementById("logs");
 const speakingIndicator = document.getElementById("speakingIndicator");
 
-// =======================
-// STATE
-// =======================
+// ================= STATE =================
+
 let ws = null;
+let wsReady = false;
 
 let recognition = null;
 let recognizing = false;
-let sessionActive = false;
+let shouldKeepListening = false;
 
-let selectedVoice = null;
+let currentTtsText = "";  // lowercased text currently being spoken
+let voicesLoaded = false;
+
+let conversationHistory = [];  // just for UI
 let lastRequestId = null;
 
-let conversation = []; // [{role:"user"|"assistant", text}]
+// ================= UTIL: LOGGING =================
 
-// =======================
-// LOGGING
-// =======================
-function log(message, isError = false) {
+function log(msg, isError = false) {
   const timestamp = new Date().toLocaleTimeString();
-  const entry = document.createElement("div");
-  entry.className = `log-entry${isError ? " error" : ""}`;
-  entry.textContent = `[${timestamp}] ${message}`;
-  logsEl.appendChild(entry);
+  const div = document.createElement("div");
+  div.className = "log-entry" + (isError ? " error" : "");
+  div.textContent = `[${timestamp}] ${msg}`;
+  logsEl.appendChild(div);
   logsEl.scrollTop = logsEl.scrollHeight;
-  console[isError ? "error" : "log"]("[LOG]", message);
+  console[isError ? "error" : "log"](msg);
 }
 
-// =======================
-// TRANSCRIPT UI
-// =======================
-function renderTranscript() {
-  if (!conversation.length) {
-    transcriptEl.textContent = "Transcript will appear here...";
-    return;
+// ================= UTIL: TRANSCRIPT UI =================
+
+function clearTranscriptIfPlaceholder() {
+  if (transcriptEl.textContent.trim() === "Transcript will appear here...") {
+    transcriptEl.innerHTML = "";
   }
+}
 
-  transcriptEl.innerHTML = "";
-  conversation.forEach((turn) => {
-    const p = document.createElement("p");
-    p.className = `turn turn-${turn.role}`;
-    const label = turn.role === "user" ? "You" : "Praxis";
-    p.innerHTML = `<strong>${label}:</strong> ${turn.text}`;
-    transcriptEl.appendChild(p);
-  });
-
+function addTranscriptLine(role, text) {
+  clearTranscriptIfPlaceholder();
+  const line = document.createElement("div");
+  line.className = "transcript-line " + role; // "user" or "assistant"
+  line.textContent = (role === "user" ? "You: " : "Praxis: ") + text;
+  transcriptEl.appendChild(line);
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
-// =======================
-// TEXT CLEANUP FOR SPEECH
-// =======================
-function sanitizeForSpeech(text) {
-  let t = text;
+// ================= TTS: SPEAKING =================
 
-  // Remove markdown bold/italics markers
-  t = t.replace(/\*\*(.+?)\*\*/g, "$1");
-  t = t.replace(/__(.+?)__/g, "$1");
-  t = t.replace(/\*(.+?)\*/g, "$1");
-  t = t.replace(/_(.+?)_/g, "$1");
+function sanitizeForSpeech(fullText) {
+  if (!fullText) return "";
 
-  // Remove leading bullets / block markers (*, -, >)
-  t = t.replace(/^[\s>*-]+\s*/gm, "");
+  let text = fullText;
 
-  // Remove backticks and backslashes
-  t = t.replace(/`+/g, "");
-  t = t.replace(/\\/g, "");
+  // Optional: cut off "Links:" / "Resources:" section so it doesn't read URLs
+  const cutIndex = text.search(/(links:|resources:)/i);
+  if (cutIndex !== -1) {
+    text = text.slice(0, cutIndex);
+  }
 
-  // Collapse multiple spaces / newlines
-  t = t.replace(/\s{2,}/g, " ").trim();
+  // Remove markdown symbols (*, _, `, #, -, > etc)
+  text = text.replace(/[*_`>#\-]+/g, " ");
 
-  return t;
+  // Fix some pronunciations (example: Excel)
+  text = text.replace(/\bExcel\b/gi, "Microsoft Excel");
+
+  // Collapse extra spaces
+  text = text.replace(/\s{2,}/g, " ");
+
+  return text.trim();
 }
 
-// =======================
-// BROWSER TTS (speechSynthesis)
-// =======================
-function pickBestVoice() {
-  const voices = window.speechSynthesis.getVoices();
-  if (!voices || !voices.length) {
-    console.log("No TTS voices available yet.");
+function pickNiceVoice() {
+  const allVoices = window.speechSynthesis.getVoices();
+  if (!allVoices || !allVoices.length) return null;
+
+  // Prefer Google voices if available (often more natural)
+  const googleVoice =
+    allVoices.find((v) =>
+      /Google US English|Google UK English/i.test(v.name)
+    ) || allVoices.find((v) => /Google/i.test(v.name));
+
+  return googleVoice || allVoices[0];
+}
+
+function speakText(fullText) {
+  if (!("speechSynthesis" in window)) {
+    log("Browser does not support speech synthesis (TTS).", true);
     return;
   }
 
-  console.log("Available voices:", voices);
+  const spoken = sanitizeForSpeech(fullText);
+  if (!spoken) return;
 
-  // Prefer a calm adult-ish English voice if possible
-  selectedVoice =
-    voices.find(
-      (v) =>
-        /en/i.test(v.lang) &&
-        /Male|Narrator|Daniel|George|Guy/i.test(v.name)
-    ) ||
-    voices.find((v) => /Google US English/i.test(v.name)) ||
-    voices.find((v) => v.lang === "en-US") ||
-    voices.find((v) => v.lang && v.lang.startsWith("en")) ||
-    voices[0];
-
-  console.log("Selected voice:", selectedVoice && selectedVoice.name);
-}
-
-window.speechSynthesis.onvoiceschanged = pickBestVoice;
-pickBestVoice();
-
-function speakText(fullText) {
-  if (!sessionActive || !fullText) return;
-
-  // Clean up markdown & weird characters before speaking
-  const cleaned = sanitizeForSpeech(fullText);
-
-  // Don't read full URLs out loud
-  const speakable = cleaned.replace(/https?:\/\/\S+/g, "a link I found");
-
+  // Cancel any current speech
   window.speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(speakable);
 
-  if (selectedVoice) {
-    utterance.voice = selectedVoice;
+  const utterance = new SpeechSynthesisUtterance(spoken);
+
+  // Slightly slower, normal pitch
+  utterance.rate = 0.95;
+  utterance.pitch = 1.0;
+
+  if (voicesLoaded) {
+    const voice = pickNiceVoice();
+    if (voice) utterance.voice = voice;
+  } else {
+    window.speechSynthesis.onvoiceschanged = () => {
+      voicesLoaded = true;
+      const voice = pickNiceVoice();
+      if (voice) utterance.voice = voice;
+    };
   }
-
-  // Slower & lower pitch for "teacher" vibe
-  utterance.rate = 0.9;   // was 1.1
-  utterance.pitch = 0.9;  // slightly deeper
-  utterance.volume = 1.0;
 
   utterance.onstart = () => {
     speakingIndicator.classList.remove("hidden");
-    log("Praxis is speaking...");
+    currentTtsText = spoken.toLowerCase();
   };
 
   utterance.onend = () => {
     speakingIndicator.classList.add("hidden");
-    log("Praxis finished speaking.");
-    // We do NOT startListening here; recognition runs continuously.
+    currentTtsText = "";
   };
 
   utterance.onerror = (e) => {
+    log("TTS error: " + e.error, true);
     speakingIndicator.classList.add("hidden");
-    log(`TTS error: ${e.error}`, true);
+    currentTtsText = "";
   };
 
   window.speechSynthesis.speak(utterance);
 }
 
-// =======================
-// BROWSER STT (SpeechRecognition)
-// =======================
-function setupRecognition() {
+// ================= STT: LISTENING =================
+
+function initSTT() {
   const SpeechRecognition =
     window.SpeechRecognition || window.webkitSpeechRecognition;
-
   if (!SpeechRecognition) {
-    log("SpeechRecognition not supported in this browser.", true);
-    alert("Your browser does not support voice recognition. Use Chrome or Edge.");
+    log(
+      "Browser does not support SpeechRecognition (STT). Use Chrome-based browser.",
+      true
+    );
     return;
   }
 
   recognition = new SpeechRecognition();
   recognition.lang = "en-US";
-  recognition.continuous = true; // keep listening
-  recognition.interimResults = true;
+  recognition.continuous = true;
+  recognition.interimResults = false;
 
   recognition.onstart = () => {
     recognizing = true;
     log("Listening...");
   };
 
-  recognition.onend = () => {
-    recognizing = false;
-    log("Stopped listening.");
-    if (sessionActive) {
-      // Auto-restart after a small pause
-      setTimeout(() => {
-        try {
-          recognition.start();
-        } catch (e) {
-          console.log("Recognition restart error:", e.message);
-        }
-      }, 400);
+  recognition.onresult = (event) => {
+    for (let i = event.resultIndex; i < event.results.length; i++) {
+      const result = event.results[i];
+      if (!result.isFinal) continue;
+
+      const transcript = result[0].transcript.trim();
+      if (!transcript) continue;
+
+      // ---- ECHO FILTER ----
+      // If transcript is long and fully contained in currentTtsText,
+      // it is almost certainly the AI's own voice, so ignore it.
+      const words = transcript.split(/\s+/);
+      if (
+        currentTtsText &&
+        words.length > 4 &&
+        currentTtsText.includes(transcript.toLowerCase())
+      ) {
+        console.log("Ignoring echo transcript:", transcript);
+        return;
+      }
+
+      // Real user speech:
+      handleUserUtterance(transcript);
     }
   };
 
   recognition.onerror = (event) => {
-    if (event.error === "no-speech") {
-      // Harmless: just means silence. Restart.
-      recognizing = false;
-      log("No speech detected, still listening...");
-      if (sessionActive) {
+    if (event.error === "no-speech" || event.error === "network") {
+      // benign, just restart if we want to keep listening
+      console.log("STT benign error:", event.error);
+      if (shouldKeepListening) {
         setTimeout(() => {
-          try {
-            recognition.start();
-          } catch (e) {}
-        }, 400);
+          if (!recognizing) {
+            try {
+              recognition.start();
+            } catch (_) {}
+          }
+        }, 500);
       }
       return;
     }
+    log("STT error: " + event.error, true);
+  };
 
-    log(`STT error: ${event.error}`, true);
+  recognition.onend = () => {
     recognizing = false;
-    if (sessionActive) {
+    if (shouldKeepListening) {
       setTimeout(() => {
         try {
           recognition.start();
-        } catch (e) {}
-      }, 800);
-    }
-  };
-
-  recognition.onresult = (event) => {
-    let finalText = "";
-    let interimText = "";
-
-    for (let i = event.resultIndex; i < event.results.length; i++) {
-      const transcript = event.results[i][0].transcript.trim();
-      if (event.results[i].isFinal) {
-        finalText += transcript + " ";
-      } else {
-        interimText += transcript + " ";
-      }
-    }
-
-    // Show interim text as user is talking
-    if (interimText) {
-      const temp = [...conversation, { role: "user", text: interimText }];
-      transcriptEl.innerHTML = "";
-      temp.forEach((turn) => {
-        const p = document.createElement("p");
-        p.className = `turn turn-${turn.role}`;
-        const label = turn.role === "user" ? "You" : "Praxis";
-        p.innerHTML = `<strong>${label}:</strong> ${turn.text}`;
-        transcriptEl.appendChild(p);
-      });
-      transcriptEl.scrollTop = transcriptEl.scrollHeight;
-    }
-
-    if (finalText.trim()) {
-      // 🔹 BARGE-IN: stop AI speech if it's talking
-      if (window.speechSynthesis.speaking) {
-        window.speechSynthesis.cancel();
-        speakingIndicator.classList.add("hidden");
-      }
-      handleUserText(finalText.trim());
+        } catch (_) {}
+      }, 400);
     }
   };
 }
 
 function startListening() {
-  if (!sessionActive) return;
-  if (!recognition) setupRecognition();
-  if (!recognition) return;
-
-  try {
-    if (!recognizing) {
+  if (!recognition) initSTT();
+  if (recognition && !recognizing) {
+    try {
       recognition.start();
+    } catch (e) {
+      console.error(e);
     }
-  } catch (e) {
-    console.log("Recognition start error:", e.message);
   }
 }
 
 function stopListening() {
+  shouldKeepListening = false;
   if (recognition && recognizing) {
     recognition.stop();
   }
 }
 
-// =======================
-// WS CALL
-// =======================
-function sendToBackend(text) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    log("WebSocket not open.", true);
+// ================= WS: TALKING TO BACKEND =================
+
+function makeRequestId() {
+  return (
+    Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8)
+  );
+}
+
+function sendUserTextOverWS(text) {
+  if (!ws || ws.readyState !== WebSocket.OPEN || !wsReady) {
+    log("WebSocket not ready; cannot send message.", true);
     return;
   }
-
-  const requestId = `${Date.now()}-${Math.random()
-    .toString(36)
-    .slice(2, 9)}`;
+  const requestId = makeRequestId();
   lastRequestId = requestId;
-
-  log(`Sending to backend: "${text}"`);
-
   ws.send(
     JSON.stringify({
       type: "user_text",
@@ -312,44 +267,53 @@ function sendToBackend(text) {
   );
 }
 
-// When STT final text is ready
-function handleUserText(text) {
-  conversation.push({ role: "user", text });
-  renderTranscript();
+function handleUserUtterance(transcript) {
+  log(`You: ${transcript}`);
+  addTranscriptLine("user", transcript);
+  conversationHistory.push({ role: "user", text: transcript });
 
-  // Keep listening; don't stop recognition here.
-  sendToBackend(text);
+  // If AI is talking, interrupt it
+  if ("speechSynthesis" in window) {
+    window.speechSynthesis.cancel();
+  }
+  currentTtsText = "";
+  speakingIndicator.classList.add("hidden");
+
+  sendUserTextOverWS(transcript);
 }
 
-// =======================
-// SESSION CONTROL
-// =======================
-function handleStart() {
+// ================= SESSION CONTROL =================
+
+function startSession() {
   const email = emailInput.value.trim();
   if (!email) {
-    log("Please enter student email", true);
+    log("Please enter student email.", true);
     return;
   }
 
-  sessionActive = false;
-  conversation = [];
-  renderTranscript();
+  transcriptEl.textContent = "Transcript will appear here...";
+  logsEl.textContent = "";
+  conversationHistory = [];
+  wsReady = false;
+  lastRequestId = null;
 
-  startBtn.disabled = true;
-  stopBtn.disabled = false;
   emailInput.disabled = true;
   lmsKeyInput.disabled = true;
+  startBtn.disabled = true;
+  stopBtn.disabled = false;
 
-  log(`Connecting to WS: ${WS_URL}`);
+  const lmsKey = lmsKeyInput.value.trim() || undefined;
+
+  log("Connecting WebSocket...");
   ws = new WebSocket(WS_URL);
 
   ws.onopen = () => {
-    log("WebSocket connected, sending start...");
+    log("WebSocket connected. Sending start...");
     ws.send(
       JSON.stringify({
         type: "start",
         student_email: email,
-        lmsKey: lmsKeyInput.value.trim() || undefined,
+        lmsKey,
       })
     );
   };
@@ -359,60 +323,88 @@ function handleStart() {
     try {
       msg = JSON.parse(event.data);
     } catch (e) {
-      console.error("Bad WS message:", event.data);
+      console.error("WS parse error:", e);
       return;
     }
 
     if (msg.type === "ready") {
-      log("Backend ready. You can start speaking.");
-      sessionActive = true;
+      log("Session ready. Starting STT...");
+      wsReady = true;
+      shouldKeepListening = true;
       startListening();
+
+      // Ask Praxis for an intro (hidden user prompt)
+      const introPrompt =
+        "Introduce yourself as Praxis, my online tutor at Pluralcode Academy, in 2–3 spoken sentences. Do NOT use bullet points or markdown.";
+      const introId = "intro-" + makeRequestId();
+      lastRequestId = introId;
+      ws.send(
+        JSON.stringify({
+          type: "user_text",
+          text: introPrompt,
+          requestId: introId,
+        })
+      );
+
       return;
     }
 
     if (msg.type === "assistant_text") {
-      // Ignore stale replies from previous questions (after barge-in)
-      if (msg.requestId && lastRequestId && msg.requestId !== lastRequestId) {
+      // Ignore stale responses (from older interrupted requests)
+      if (
+        msg.requestId &&
+        lastRequestId &&
+        msg.requestId !== lastRequestId
+      ) {
         console.log("Ignoring stale response:", msg.requestId);
         return;
       }
 
-      const reply = msg.text || "";
-      conversation.push({ role: "assistant", text: reply });
-      renderTranscript();
-      speakText(reply);
+      const aiText = msg.text || "";
+      log("Praxis replied.");
+      addTranscriptLine("assistant", aiText);
+      conversationHistory.push({ role: "assistant", text: aiText });
+      speakText(aiText);
       return;
     }
 
     if (msg.type === "error") {
-      log(`ERROR: ${msg.error}`, true);
+      log("Backend error: " + msg.error, true);
       return;
     }
   };
 
-  ws.onerror = (event) => {
-    console.error("WS error:", event);
-    log("WebSocket error", true);
+  ws.onerror = (e) => {
+    console.error("WS error:", e);
+    log("WebSocket error.", true);
   };
 
   ws.onclose = () => {
-    log("WebSocket closed / session ended");
-    sessionActive = false;
+    log("WebSocket closed.");
+    wsReady = false;
     stopListening();
-    window.speechSynthesis.cancel();
+
+    if ("speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+    }
+    currentTtsText = "";
     speakingIndicator.classList.add("hidden");
 
-    startBtn.disabled = false;
-    stopBtn.disabled = true;
     emailInput.disabled = false;
     lmsKeyInput.disabled = false;
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
   };
 }
 
-function handleStop() {
-  sessionActive = false;
+function stopSession() {
+  shouldKeepListening = false;
   stopListening();
-  window.speechSynthesis.cancel();
+
+  if ("speechSynthesis" in window) {
+    window.speechSynthesis.cancel();
+  }
+  currentTtsText = "";
   speakingIndicator.classList.add("hidden");
 
   if (ws && ws.readyState === WebSocket.OPEN) {
@@ -420,18 +412,19 @@ function handleStop() {
     ws.close();
   }
 
+  emailInput.disabled = false;
+  lmsKeyInput.disabled = false;
+  startBtn.disabled = false;
+  stopBtn.disabled = true;
+
   log("Session stopped.");
 }
 
-// =======================
-// EVENT LISTENERS
-// =======================
-startBtn.addEventListener("click", handleStart);
-stopBtn.addEventListener("click", handleStop);
+// ================= EVENT LISTENERS =================
+
+startBtn.addEventListener("click", startSession);
+stopBtn.addEventListener("click", stopSession);
 
 window.addEventListener("beforeunload", () => {
-  sessionActive = false;
-  if (ws) ws.close();
-  stopListening();
-  window.speechSynthesis.cancel();
+  stopSession();
 });
