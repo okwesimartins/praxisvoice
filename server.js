@@ -285,7 +285,7 @@ const GEMINI_LIVE_WS =
   "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
 const LIVE_MODEL_ENV =
-  process.env.GEMINI_LIVE_MODEL || "gemini-2.5-flash-native-audio-preview-09-2025";
+  process.env.GEMINI_LIVE_MODEL || "gemini-2.0-flash-exp";
 const LIVE_MODEL =
   LIVE_MODEL_ENV.startsWith("models/") ? LIVE_MODEL_ENV : `models/${LIVE_MODEL_ENV}`;
 
@@ -313,7 +313,7 @@ function openGeminiLiveSocket({ systemInstruction, tools }) {
       setup: {
         model: LIVE_MODEL,
         generationConfig: {
-          responseModalities: ["AUDIO", "TEXT"],
+          responseModalities: ["TEXT","AUDIO"],
           temperature: 0.4,
           maxOutputTokens: 512,
           speechConfig: {
