@@ -1,8 +1,8 @@
 /**
  * server.js — Praxis Voice Backend (Gemini text + Google TTS + WebSocket)
- * - Express health + serves static frontend (optional)
+ * - Express health + serves static frontend (public/voice-app.html)
  * - WS /ws: browser text <-> Gemini text API + Google Text-to-Speech
- * - Enforces LMS key + student course scope
+ * - Enforces LMS key + student course scope (similar logic to Slack index.js)
  */
 
 if (process.env.NODE_ENV !== "production") {
@@ -38,7 +38,7 @@ process.on("unhandledRejection", (e) =>
 );
 
 // -----------------------------------------------------------------------------
-// EXPRESS APP (health + optional static frontend)
+// EXPRESS APP (health + static frontend)
 // -----------------------------------------------------------------------------
 const app = express();
 app.use(cors());
@@ -49,32 +49,43 @@ app.get("/", (req, res) =>
 );
 app.get("/health", (req, res) => res.json({ status: "healthy" }));
 
-// Serve frontend (optional)
+// Serve static frontend from /public
 app.use(express.static(path.join(__dirname, "public")));
 app.get("/voice", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "voice-app.html"));
 });
 
 // -----------------------------------------------------------------------------
-// Pluralcode scope enforcement
+// Pluralcode scope enforcement (aligned with index.js logic)
 // -----------------------------------------------------------------------------
 const PLURALCODE_API_BASE =
   process.env.PLURALCODE_API_URL || "https://backend.pluralcode.institute";
 
 const normalizeEmail = (e) => String(e || "").trim().toLowerCase();
 
+// --- timeouts helper ---
+const withTimeout = async (promise, ms, msg = "Timed out") => {
+  const timeout = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error(msg)), ms)
+  );
+  return Promise.race([promise, timeout]);
+};
+
+// Synonyms like in index.js (Data Analytics -> Excel, NumPy, pandas, etc.)
 const addSynonyms = (phrase, bag) => {
   const raw = String(phrase || "");
   const display = raw.trim();
   const p = display.toLowerCase();
   if (!display) return bag;
-  bag.add(display);
+  bag.add(display); // keep original string as well
 
+  // General
   if (/javascript/.test(p)) {
     bag.add("javascript");
     bag.add("js");
   }
 
+  // Data / Python ecosystem
   if (/python/.test(p) || /data\s*analytics?/.test(p)) {
     [
       "python",
@@ -87,6 +98,9 @@ const addSynonyms = (phrase, bag) => {
       "anaconda",
       "etl",
       "data wrangling",
+      "excel",
+      "power bi",
+      "sql",
     ].forEach((x) => bag.add(x));
   }
   if (/\bsql\b/.test(p)) bag.add("sql");
@@ -103,6 +117,7 @@ const addSynonyms = (phrase, bag) => {
   if (/web\s*scraping/.test(p)) bag.add("web scraping");
   if (/dax/.test(p)) bag.add("dax");
 
+  // Agile / Scrum
   if (/\bscrum\b|agile/.test(p)) {
     "scrum,agile,scrum events,scrum ceremonies,agile ceremonies,sprint planning,daily scrum,daily standup,sprint review,sprint retrospective,backlog refinement,product backlog refinement"
       .split(",")
@@ -113,6 +128,7 @@ const addSynonyms = (phrase, bag) => {
   return bag;
 };
 
+// Keys we consider as “topic strings” in the curriculum payload
 const TOPIC_STRING_KEYS = new Set([
   "coursename",
   "course",
@@ -131,6 +147,21 @@ const TOPIC_STRING_KEYS = new Set([
   "unit",
 ]);
 
+// Arrays of nested topics
+const TOPIC_ARRAY_KEYS = new Set([
+  "course_topics",
+  "topics",
+  "sub_topic",
+  "sub_topics",
+  "children",
+  "modules",
+  "lessons",
+  "chapters",
+  "sections",
+  "units",
+  "items",
+]);
+
 function harvestCourseStrings(node, bag) {
   if (!node) return;
   if (Array.isArray(node)) {
@@ -140,12 +171,16 @@ function harvestCourseStrings(node, bag) {
   if (typeof node === "object") {
     for (const [k, v] of Object.entries(node)) {
       const key = String(k).toLowerCase();
+
       if (typeof v === "string") {
         if (TOPIC_STRING_KEYS.has(key)) {
           const s = v.trim();
-          if (s && !/^https?:\/\//i.test(s) && s.length <= 200)
+          if (s && !/^https?:\/\//i.test(s) && s.length <= 200) {
             addSynonyms(s, bag);
+          }
         }
+      } else if (Array.isArray(v) && TOPIC_ARRAY_KEYS.has(key)) {
+        for (const child of v) harvestCourseStrings(child, bag);
       } else if (Array.isArray(v)) {
         for (const child of v) harvestCourseStrings(child, bag);
       } else if (typeof v === "object" && v) {
@@ -159,36 +194,30 @@ const buildAllowedFromPayload = (data) => {
   const phrases = new Set();
   const courseNames = [];
 
-  const enrolled = Array.isArray(data.enrolled_courses)
-    ? data.enrolled_courses
-    : [];
-  for (const c of enrolled) {
-    const courseName = (
-      c.coursename ||
-      c.course_name ||
-      c.name ||
-      c.title ||
-      ""
-    ).trim();
-    if (courseName) {
-      courseNames.push(courseName);
-      addSynonyms(courseName, phrases);
+  try {
+    const enrolled = Array.isArray(data.enrolled_courses)
+      ? data.enrolled_courses
+      : [];
+    for (const c of enrolled) {
+      const courseName = (
+        c.coursename ||
+        c.course_name ||
+        c.name ||
+        c.title ||
+        ""
+      ).trim();
+      if (courseName) {
+        courseNames.push(courseName);
+        addSynonyms(courseName, phrases);
+      }
+      if (c.course_topics) harvestCourseStrings(c.course_topics, phrases);
+      else harvestCourseStrings(c, phrases);
     }
-    if (c.course_topics) harvestCourseStrings(c.course_topics, phrases);
-    else harvestCourseStrings(c, phrases);
-  }
-
-  const sandbox = Array.isArray(data.sandbox) ? data.sandbox : [];
-  for (const s of sandbox) harvestCourseStrings(s, phrases);
+    const sandbox = Array.isArray(data.sandbox) ? data.sandbox : [];
+    for (const s of sandbox) harvestCourseStrings(s, phrases);
+  } catch (_) {}
 
   return { courseNames, allowedPhrases: Array.from(phrases) };
-};
-
-const withTimeout = async (promise, ms, msg = "Timed out") => {
-  const timeout = new Promise((_, reject) =>
-    setTimeout(() => reject(new Error(msg)), ms)
-  );
-  return Promise.race([promise, timeout]);
 };
 
 async function getStudentScope(email) {
@@ -198,15 +227,18 @@ async function getStudentScope(email) {
   const url = `${PLURALCODE_API_BASE}/student/praxis_get_student_courses?email=${encodeURIComponent(
     clean
   )}`;
-  const response = await withTimeout(fetch(url), 8000, "Pluralcode API timeout");
-  if (!response.ok)
-    throw new Error(`Pluralcode API failed with status ${response.status}`);
-
-  const data = await response.json();
-  const scope = buildAllowedFromPayload(data);
-  if (!scope.courseNames.length)
-    throw new Error("No active course enrollment found.");
-  return scope;
+  try {
+    const response = await withTimeout(fetch(url), 8000, "Pluralcode API timeout");
+    if (!response.ok)
+      throw new Error(`Pluralcode API failed with status ${response.status}`);
+    const data = await response.json();
+    const scope = buildAllowedFromPayload(data);
+    if (!scope.courseNames.length)
+      throw new Error("No active course enrollment found.");
+    return scope;
+  } catch (error) {
+    throw new Error("Could not verify student enrollment.");
+  }
 }
 
 const summarizeAllowed = (arr, n = 80) => {
@@ -220,29 +252,19 @@ function buildContextHeader(studentEmail, enrolledCourseNames, allowedPhrases) {
   return `[CONTEXT]
 Student Email: ${studentEmail}
 Enrolled Course(s): "${enrolledCourseNames}"
-[ALLOWED TOPICS SAMPLE] (truncated): ${sample}
+[ALLOWED TOPICS EXAMPLES] (not exhaustive, you may generalize): ${sample}
+
 [POLICY]
-- Answer ONLY if the topic is within the student's curriculum/sandbox.
-- If out of scope, briefly say it's outside their program and offer 2–3 in-scope alternatives.
-- You are a calm, friendly MALE online tutor called Praxis.
-- Teach step by step, with concrete examples and short check-in questions.
-- Only sometimes offer a quiz, after several teaching turns, when it feels natural.
-- Before giving a quiz, ask the student if they'd LIKE a quiz. Only if they agree, send a quiz.
-
-QUIZ FORMAT (ONLY WHEN STUDENT AGREES)
-- When you give a multiple-choice quiz, append a line starting with:
-  QUIZ: {"question":"...","options":["A","B","C"],"correctIndex":1,"explanation":"..."}
-- The JSON must be valid, single-line, and only contain those fields.
-- Do NOT put markdown inside the JSON.
-
-LINKS
-- When suggesting YouTube videos or articles, include full URLs in the TEXT so the UI can make previews.
-- Write links on their own lines when possible.
-- Avoid reading out full URLs in voice; just describe them verbally in natural language.`;
+- You are Praxis, a calm, friendly MALE online tutor for Pluralcode Academy.
+- Focus on the student's enrolled course(s) and closely related tools and topics.
+- Tools and concepts that are standard for these courses (for example: Excel, Power BI, SQL, Python, NumPy, pandas, Jupyter, ETL, Scrum, Kanban, etc.) are considered IN SCOPE even if the exact word does not literally appear in the raw curriculum text.
+- Only say a topic is "outside their curriculum" if it is clearly unrelated to *all* enrolled courses (e.g. medicine for a Data Analytics student).
+- If something is ambiguous but plausibly part of their course (like Excel for Data Analytics), treat it as in-scope and answer.
+- When recommending YouTube videos or articles, include full URLs in the text so the UI can show previews. Do not read the URLs aloud in detail; in voice, just mention that you are sharing a link.`;
 }
 
 // -----------------------------------------------------------------------------
-// (Optional) Google search helpers (not wired as tools here)
+// (Optional) Google search helpers (kept here if you want to wire tools later)
 // -----------------------------------------------------------------------------
 const Google_Search_API_KEY = process.env.Google_Search_API_KEY;
 const Google_Search_CX_ID = process.env.Google_Search_CX_ID;
@@ -270,7 +292,19 @@ const validateUrl = async (url) => {
   try {
     const res = await withTimeout(fetch(url, { method: "HEAD" }), 3500);
     if (res.ok || (res.status >= 300 && res.status < 400)) return true;
-  } catch (_) {}
+  } catch (_) {
+    try {
+      const res2 = await withTimeout(
+        fetch(url, {
+          method: "GET",
+          headers: { Range: "bytes=0-1024" },
+        }),
+        4500,
+        "URL GET timeout"
+      );
+      if (res2.ok || (res2.status >= 300 && res2.status < 400)) return true;
+    } catch (__) {}
+  }
   return false;
 };
 
@@ -286,6 +320,9 @@ const cleanAndValidateResults = async (items, max = 3) => {
 };
 
 async function search_youtube_for_videos({ query }) {
+  if (!Google_Search_API_KEY) {
+    return { message: "YouTube search is not configured." };
+  }
   const response = await withTimeout(
     youtube.search.list({
       part: "snippet",
@@ -311,6 +348,9 @@ async function search_youtube_for_videos({ query }) {
 }
 
 async function search_web_for_articles({ query }) {
+  if (!Google_Search_API_KEY || !Google_Search_CX_ID) {
+    return { message: "Web search is not configured." };
+  }
   const url = `https://www.googleapis.com/customsearch/v1?key=${Google_Search_API_KEY}&cx=${Google_Search_CX_ID}&q=${encodeURIComponent(
     query
   )}`;
@@ -345,17 +385,27 @@ const GEMINI_MODEL = RAW_MODEL.startsWith("models/")
   : `models/${RAW_MODEL}`;
 
 const BASE_SYSTEM_INSTRUCTION = `
-You are Praxis, a specialized MALE AI tutor for Pluralcode Academy.
+You are Praxis, a specialized MALE AI tutor for Pluralcode Academy students.
 
-PLURALCODE KNOWLEDGE BASE (MANDATORY USAGE)
-- Official brand/site info: https://pluralcode.academy.
-- Course structure/modules/details must use official Pluralcode curriculum PDFs.
-CORE RULES
-1) Stay strictly within the student's enrolled course scope; sandbox topics are always allowed.
-2) Explain in a patient, teacher-like way, with concrete examples and short check-in questions.
-3) Prefer authoritative sources when suggesting external resources.
-4) Include links in text when appropriate (YouTube, documentation, articles). Do not read out full URLs; summarize verbally instead.
-5) Only occasionally offer a quiz, after some teaching and only if the student agrees. Do NOT include QUIZ JSON in every answer. 
+ROLE & STYLE
+- Teach like a patient human teacher: break explanations into steps, use simple examples, and ask brief check-in questions.
+- Keep your tone friendly, calm, and professional.
+- You are primarily used through VOICE, but your text answers are also shown on screen.
+
+QUIZZES
+- Only sometimes offer a quiz after you have explained a topic for a bit and the student seems ready.
+- First ask if they would LIKE a short quiz. Only generate quiz questions if the student agrees.
+- When you do provide a multiple-choice quiz, append one or more lines in this format:
+  QUIZ: {"question":"...","options":["A","B","C","D"],"correctIndex":1,"explanation":"..."}
+- The JSON must be valid, single-line, with only those fields and no markdown inside the JSON.
+
+LINKS & RESOURCES
+- When you recommend YouTube videos or articles, include full URLs in the TEXT so the UI can show previews.
+- In voice, do NOT read out the full URL; just say something like: "I'm sharing a YouTube link in your resources panel."
+
+SCOPE
+- You must follow the additional scope rules and allowed topics that will be provided in a [CONTEXT] block for each student.
+- If a request is clearly unrelated to their enrolled courses, briefly say so and suggest 2–3 in-scope alternatives instead.
 `;
 
 /**
@@ -405,7 +455,7 @@ async function callGeminiChat({ systemInstruction, contents }) {
 }
 
 // -----------------------------------------------------------------------------
-// GOOGLE TTS — sanitize + synthesize
+// GOOGLE TTS — sanitize + synthesize (no links or weird characters)
 // -----------------------------------------------------------------------------
 
 function sanitizeForSpeech(text) {
@@ -413,7 +463,7 @@ function sanitizeForSpeech(text) {
 
   let t = text;
 
-  // Remove QUIZ JSON so it doesn't read out raw JSON
+  // Remove QUIZ JSON so it doesn't read raw JSON
   t = t.replace(/QUIZ:\s*{[^}]*}/gi, " ");
 
   // Cut off sections starting with "Links:" or "Resources:"
@@ -439,8 +489,11 @@ function sanitizeForSpeech(text) {
   t = t.replace(/[*_>#\-]+/g, " "); // bullets, markdown
   t = t.replace(/[•~_=^]+/g, " "); // bullets and decorations
 
-  // Remove brackets, slashes, pipes
+  // Remove brackets, slashes, pipes, etc.
   t = t.replace(/[\[\]\(\)\{\}<>\/\\|]+/g, " ");
+
+  // Squash multiple punctuation
+  t = t.replace(/[;:]{2,}/g, " ");
 
   // Fix some pronunciations
   t = t.replace(/\bExcel\b/gi, "Microsoft Excel");
@@ -538,7 +591,7 @@ app.post("/api/chat", async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// WebSocket /ws — text chat for voice UI (with TTS audio)
+// WebSocket /ws — text chat for voice UI (with Google TTS audio)
 // -----------------------------------------------------------------------------
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/ws" });

@@ -14,7 +14,6 @@ const transcriptEl = document.getElementById("transcript");
 const logsEl = document.getElementById("logs");
 const speakingIndicator = document.getElementById("speakingIndicator");
 
-// new / fixed:
 const resourcesEl = document.getElementById("resources");
 const quizArea = document.getElementById("quizContainer");
 const quizScoreEl = document.getElementById("quizScore");
@@ -25,8 +24,9 @@ let ws = null;
 let wsReady = false;
 
 let recognition = null;
-let isListening = false;
-let talkModeActive = false;
+let sttActive = false;          // browser recognition currently running
+let talkSessionActive = false;  // "I pressed Talk and I'm expecting speech"
+let hasHeardSpeech = false;     // did this talk session get any final transcript?
 
 let currentAudio = null;
 let conversationHistory = [];
@@ -77,6 +77,7 @@ function extractYoutubeLinks(text) {
   let match;
   while ((match = urlRegex.exec(text)) !== null) {
     let url = match[1];
+    // strip trailing punctuation
     url = url.replace(/[),.]+$/, "");
     if (url.includes("youtube.com/watch") || url.includes("youtu.be")) {
       links.push(url);
@@ -292,7 +293,7 @@ function playAssistantAudio(base64Audio, mimeType) {
   }
 }
 
-// ================= STT: LISTENING (talkMode stays on) =================
+// ================= STT: PUSH-TO-TALK (one utterance) =================
 
 function initSTT() {
   const SpeechRecognition =
@@ -307,75 +308,97 @@ function initSTT() {
 
   const rec = new SpeechRecognition();
   rec.lang = "en-US";
-  rec.continuous = true;
-  rec.interimResults = false;
+  rec.continuous = false;      // ONE utterance per start()
+  rec.interimResults = false;  // only final results
 
   rec.onstart = () => {
-    isListening = true;
-    log("Listening for your question...");
+    sttActive = true;
+    log("Listening... start speaking.");
     talkBtn.classList.add("listening");
     talkBtn.textContent = "Stop Listening";
   };
 
   rec.onresult = (event) => {
+    let finalTranscript = "";
     for (let i = event.resultIndex; i < event.results.length; i++) {
       const result = event.results[i];
-      if (!result.isFinal) continue;
-      const transcript = (result[0] && result[0].transcript) || "";
-      const text = transcript.trim();
-      if (!text) continue;
-      handleUserUtterance(text);
+      if (result.isFinal) {
+        finalTranscript += result[0].transcript;
+      }
+    }
+    finalTranscript = finalTranscript.trim();
+    if (finalTranscript) {
+      hasHeardSpeech = true;
+      handleUserUtterance(finalTranscript);
     }
   };
 
   rec.onerror = (event) => {
     console.error("STT error:", event);
-    if (event.error === "no-speech" || event.error === "network") {
-      if (talkModeActive) {
-        setTimeout(() => {
-          if (!isListening) {
-            try {
-              rec.start();
-            } catch (_) {}
-          }
-        }, 400);
-      }
+    // If no-speech while we're still waiting for the user to talk, let onend handle restart.
+    if (event.error === "no-speech" && talkSessionActive && !hasHeardSpeech) {
       return;
     }
-    log("STT error: " + event.error, true);
+    // Any other error: end this talk session
+    talkSessionActive = false;
+    hasHeardSpeech = false;
+    sttActive = false;
+    talkBtn.classList.remove("listening");
+    talkBtn.textContent = "🎙️ Talk";
+    if (event.error !== "aborted") {
+      log("STT error: " + event.error, true);
+    }
   };
 
   rec.onend = () => {
-    isListening = false;
-    if (talkModeActive) {
+    sttActive = false;
+
+    // If user pressed Talk and we haven't heard speech yet, keep listening.
+    if (talkSessionActive && !hasHeardSpeech) {
       setTimeout(() => {
-        try {
-          rec.start();
-        } catch (e) {
-          console.error("STT restart error:", e);
+        if (talkSessionActive && !sttActive) {
+          try {
+            rec.start();
+          } catch (e) {
+            console.error("STT restart error:", e);
+            talkSessionActive = false;
+            talkBtn.classList.remove("listening");
+            talkBtn.textContent = "🎙️ Talk";
+          }
         }
       }, 300);
-    } else {
-      talkBtn.classList.remove("listening");
-      talkBtn.textContent = "🎙️ Talk";
+      return;
     }
+
+    // Normal end (we got speech or user cancelled)
+    talkSessionActive = false;
+    hasHeardSpeech = false;
+    talkBtn.classList.remove("listening");
+    talkBtn.textContent = "🎙️ Talk";
   };
 
   return rec;
 }
 
-function ensureSTTAndStart() {
+function startOneShotListening() {
   if (!recognition) {
     recognition = initSTT();
   }
   if (!recognition) return;
+  if (sttActive) return;
 
-  if (!isListening) {
-    try {
-      recognition.start();
-    } catch (e) {
-      console.error("recognition.start error:", e);
-    }
+  talkSessionActive = true;
+  hasHeardSpeech = false;
+
+  try {
+    recognition.start();
+  } catch (e) {
+    console.error("recognition.start error:", e);
+    talkSessionActive = false;
+    hasHeardSpeech = false;
+    sttActive = false;
+    talkBtn.classList.remove("listening");
+    talkBtn.textContent = "🎙️ Talk";
   }
 }
 
@@ -408,6 +431,7 @@ function handleUserUtterance(transcript) {
   addTranscriptLine("user", transcript);
   conversationHistory.push({ role: "user", text: transcript });
 
+  // Once user talks, stop any current AI speech (manual barge-in)
   stopCurrentAudio();
 
   sendUserTextOverWS(transcript);
@@ -442,8 +466,11 @@ function startSession() {
   conversationHistory = [];
   wsReady = false;
   lastRequestId = null;
-  talkModeActive = false;
-  isListening = false;
+
+  // reset STT state
+  talkSessionActive = false;
+  hasHeardSpeech = false;
+  sttActive = false;
 
   emailInput.disabled = true;
   lmsKeyInput.disabled = true;
@@ -522,11 +549,13 @@ function startSession() {
     wsReady = false;
     stopCurrentAudio();
 
-    talkModeActive = false;
-    if (recognition && isListening) {
+    // Stop any listening session
+    talkSessionActive = false;
+    hasHeardSpeech = false;
+    if (recognition && sttActive) {
       recognition.stop();
     }
-    isListening = false;
+    sttActive = false;
     talkBtn.classList.remove("listening");
     talkBtn.textContent = "🎙️ Talk";
 
@@ -541,11 +570,12 @@ function startSession() {
 function stopSession() {
   stopCurrentAudio();
 
-  talkModeActive = false;
-  if (recognition && isListening) {
+  talkSessionActive = false;
+  hasHeardSpeech = false;
+  if (recognition && sttActive) {
     recognition.stop();
   }
-  isListening = false;
+  sttActive = false;
   talkBtn.classList.remove("listening");
   talkBtn.textContent = "🎙️ Talk";
 
@@ -571,21 +601,24 @@ function handleTalkClick() {
     return;
   }
 
+  // If AI is currently speaking, interrupt it first
   if (currentAudio) {
     stopCurrentAudio();
   }
 
-  if (!talkModeActive) {
-    talkModeActive = true;
-    log("Listening mode ON. Speak whenever you're ready.");
-    ensureSTTAndStart();
+  // If not currently in a talk session, start one-shot listening.
+  if (!talkSessionActive && !sttActive) {
+    log("Listening mode ON. Start speaking when you're ready.");
+    startOneShotListening();
   } else {
-    talkModeActive = false;
+    // User clicked again to cancel listening
     log("Listening mode OFF.");
-    if (recognition && isListening) {
+    talkSessionActive = false;
+    hasHeardSpeech = false;
+    if (recognition && sttActive) {
       recognition.stop();
     }
-    isListening = false;
+    sttActive = false;
     talkBtn.classList.remove("listening");
     talkBtn.textContent = "🎙️ Talk";
   }
