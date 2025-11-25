@@ -13,7 +13,10 @@ const stopBtn = document.getElementById("stopBtn");
 const transcriptEl = document.getElementById("transcript");
 const logsEl = document.getElementById("logs");
 const speakingIndicator = document.getElementById("speakingIndicator");
-const quizArea = document.getElementById("quizArea");
+
+// new / fixed:
+const resourcesEl = document.getElementById("resources");
+const quizArea = document.getElementById("quizContainer");
 const quizScoreEl = document.getElementById("quizScore");
 
 // ================= STATE =================
@@ -98,8 +101,14 @@ function getYouTubeIdFromUrl(url) {
 }
 
 function renderYoutubePreview(url) {
+  if (!resourcesEl) return;
   const videoId = getYouTubeIdFromUrl(url);
   if (!videoId) return;
+
+  // remove placeholder once we have first resource
+  const ph = resourcesEl.querySelector(".placeholder");
+  if (ph) ph.remove();
+
   const card = document.createElement("div");
   card.className = "yt-card";
   card.innerHTML = `
@@ -111,8 +120,7 @@ function renderYoutubePreview(url) {
       </div>
     </a>
   `;
-  transcriptEl.appendChild(card);
-  transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  resourcesEl.appendChild(card);
 }
 
 // ================= QUIZ PARSING & RENDER =================
@@ -147,6 +155,7 @@ function extractQuizzesFromText(text) {
 }
 
 function updateQuizScoreDisplay() {
+  if (!quizScoreEl) return;
   if (quizTotal === 0) {
     quizScoreEl.textContent = "No quizzes completed yet.";
   } else {
@@ -155,6 +164,12 @@ function updateQuizScoreDisplay() {
 }
 
 function renderQuiz(quiz) {
+  if (!quizArea) return;
+
+  // remove placeholder on first quiz
+  const ph = quizArea.querySelector(".placeholder");
+  if (ph) ph.remove();
+
   const card = document.createElement("div");
   card.className = "quiz-card";
 
@@ -166,7 +181,8 @@ function renderQuiz(quiz) {
   const optionsWrap = document.createElement("div");
   optionsWrap.className = "quiz-options";
 
-  const name = "quiz-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+  const name =
+    "quiz-" + Date.now() + "-" + Math.random().toString(36).slice(2);
 
   quiz.options.forEach((opt, idx) => {
     const optId = `${name}-${idx}`;
@@ -291,8 +307,8 @@ function initSTT() {
 
   const rec = new SpeechRecognition();
   rec.lang = "en-US";
-  rec.continuous = true;        // keep stream open
-  rec.interimResults = false;   // only final results
+  rec.continuous = true;
+  rec.interimResults = false;
 
   rec.onstart = () => {
     isListening = true;
@@ -314,7 +330,6 @@ function initSTT() {
 
   rec.onerror = (event) => {
     console.error("STT error:", event);
-    // If it's no-speech or network, and talk mode is active, just restart
     if (event.error === "no-speech" || event.error === "network") {
       if (talkModeActive) {
         setTimeout(() => {
@@ -332,7 +347,6 @@ function initSTT() {
 
   rec.onend = () => {
     isListening = false;
-    // If talk mode is still active, restart listening so the mic stays open
     if (talkModeActive) {
       setTimeout(() => {
         try {
@@ -343,7 +357,7 @@ function initSTT() {
       }, 300);
     } else {
       talkBtn.classList.remove("listening");
-      talkBtn.textContent = "🎤 Talk to Praxis";
+      talkBtn.textContent = "🎙️ Talk";
     }
   };
 
@@ -394,7 +408,6 @@ function handleUserUtterance(transcript) {
   addTranscriptLine("user", transcript);
   conversationHistory.push({ role: "user", text: transcript });
 
-  // Once user talks, stop any current AI speech (manual barge-in)
   stopCurrentAudio();
 
   sendUserTextOverWS(transcript);
@@ -411,8 +424,19 @@ function startSession() {
 
   transcriptEl.textContent = "Transcript will appear here...";
   logsEl.textContent = "";
-  quizArea.innerHTML = "";
-  quizScoreEl.textContent = "";
+
+  if (resourcesEl) {
+    resourcesEl.innerHTML =
+      '<p class="placeholder">Links and YouTube previews will appear here when Praxis shares resources.</p>';
+  }
+  if (quizArea) {
+    quizArea.innerHTML =
+      '<p class="placeholder">No quiz yet. Ask Praxis to test you with a short quiz.</p>';
+  }
+  if (quizScoreEl) {
+    quizScoreEl.textContent = "No quizzes completed yet.";
+  }
+
   quizCorrect = 0;
   quizTotal = 0;
   conversationHistory = [];
@@ -427,7 +451,7 @@ function startSession() {
   stopBtn.disabled = false;
   talkBtn.disabled = true;
   talkBtn.classList.remove("listening");
-  talkBtn.textContent = "🎤 Talk to Praxis";
+  talkBtn.textContent = "🎙️ Talk";
 
   const lmsKey = lmsKeyInput.value.trim() || undefined;
 
@@ -498,14 +522,13 @@ function startSession() {
     wsReady = false;
     stopCurrentAudio();
 
-    // Stop STT mode
     talkModeActive = false;
     if (recognition && isListening) {
       recognition.stop();
     }
     isListening = false;
     talkBtn.classList.remove("listening");
-    talkBtn.textContent = "🎤 Talk to Praxis";
+    talkBtn.textContent = "🎙️ Talk";
 
     emailInput.disabled = false;
     lmsKeyInput.disabled = false;
@@ -524,7 +547,7 @@ function stopSession() {
   }
   isListening = false;
   talkBtn.classList.remove("listening");
-  talkBtn.textContent = "🎤 Talk to Praxis";
+  talkBtn.textContent = "🎙️ Talk";
 
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ type: "stop" }));
@@ -548,12 +571,10 @@ function handleTalkClick() {
     return;
   }
 
-  // If AI is currently speaking, interrupt it first
   if (currentAudio) {
     stopCurrentAudio();
   }
 
-  // Toggle talk mode
   if (!talkModeActive) {
     talkModeActive = true;
     log("Listening mode ON. Speak whenever you're ready.");
@@ -566,7 +587,7 @@ function handleTalkClick() {
     }
     isListening = false;
     talkBtn.classList.remove("listening");
-    talkBtn.textContent = "🎤 Talk to Praxis";
+    talkBtn.textContent = "🎙️ Talk";
   }
 }
 
