@@ -1,6 +1,6 @@
 /**
- * server.js — Single-file Praxis Voice on Cloud Run (Buildpacks OK)
- * - Express health + serves /voice test HTML
+ * server.js — Praxis Voice Backend (Cloud Run)
+ * - Express health + serves static frontend
  * - WS /ws: browser audio <-> Gemini Live API
  * - Enforces LMS key + student course scope
  * - Supports tool calling (Google Web + YouTube search)
@@ -13,6 +13,7 @@ if (process.env.NODE_ENV !== "production") {
 const http = require("http");
 const express = require("express");
 const cors = require("cors");
+const path = require("path");
 const WebSocket = require("ws");
 const crypto = require("crypto");
 const { google } = require("googleapis");
@@ -30,27 +31,26 @@ process.on("uncaughtException", (e) => console.error("UNCAUGHT_EXCEPTION", e));
 process.on("unhandledRejection", (e) => console.error("UNHANDLED_REJECTION", e));
 
 // -----------------------------------------------------------------------------
-// EXPRESS APP (health + voice test page)
+// EXPRESS APP (health check only - frontend hosted separately)
 // -----------------------------------------------------------------------------
 const app = express();
 app.use(cors());
 app.use(express.json());
 
-app.get("/", (req, res) => res.type("text").send("ok"));
-app.get("/voice", (req, res) => {
-  res.setHeader("content-type", "text/html");
-  res.send(VOICE_HTML);
-});
+app.get("/", (req, res) => res.json({ status: "ok", service: "Praxis Voice API" }));
+app.get("/health", (req, res) => res.json({ status: "healthy" }));
 
+app.get("/voice", (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "voice-app.html"));
+});
 // -----------------------------------------------------------------------------
-// Pluralcode scope enforcement (same as your API version, simplified)
+// Pluralcode scope enforcement
 // -----------------------------------------------------------------------------
 const PLURALCODE_API_BASE =
   process.env.PLURALCODE_API_URL || "https://backend.pluralcode.institute";
 
 const normalizeEmail = (e) => String(e || "").trim().toLowerCase();
 
-// Synonyms (expanded)
 const addSynonyms = (phrase, bag) => {
   const raw = String(phrase || "");
   const display = raw.trim();
@@ -276,12 +276,11 @@ const toolDefs = [{
 }];
 
 // -----------------------------------------------------------------------------
-// Gemini Live API bridge  ✅ FIXED FOR RAW WS
+// Gemini Live API bridge
 // -----------------------------------------------------------------------------
 const GEMINI_LIVE_WS =
   "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
-// ✅ IMPORTANT: raw WS requires models/<id>
 const LIVE_MODEL_ENV =
   process.env.GEMINI_LIVE_MODEL || "gemini-2.5-flash-native-audio-preview-09-2025";
 const LIVE_MODEL =
@@ -311,13 +310,13 @@ function openGeminiLiveSocket({ systemInstruction, tools }) {
       setup: {
         model: LIVE_MODEL,
         generationConfig: {
-          responseModalities: ["AUDIO"], // ✅ FIXED: Audio only
+          responseModalities: ["AUDIO"],
           temperature: 0.4,
           maxOutputTokens: 512,
-          speechConfig: { // ✅ ADDED: Required for audio output
+          speechConfig: {
             voiceConfig: {
               prebuiltVoiceConfig: {
-                voiceName: "Aoede" // Options: Aoede, Puck, Charon, Kore, Fenrir
+                voiceName: "Puck" // Lighter, more energetic voice (was Aoede)
               }
             }
           }
@@ -328,7 +327,6 @@ function openGeminiLiveSocket({ systemInstruction, tools }) {
       }
     };
 
-    // Only add tools if they exist and are properly formatted
     if (tools && Array.isArray(tools) && tools.length > 0 && tools[0].functionDeclarations?.length > 0) {
       setupPayload.setup.tools = tools;
     }
@@ -364,7 +362,6 @@ wss.on("connection", (clientWs) => {
       try {
         sessionId = msg.sessionId || sessionId;
 
-        // LMS key check
         if (msg.lmsKey && msg.lmsKey !== process.env.MY_LMS_API_KEY) {
           sendClient({ type: "error", error: "Unauthorized client" });
           clientWs.close();
@@ -406,7 +403,6 @@ wss.on("connection", (clientWs) => {
             }
           }
 
-          // tool calling
           if (gm.toolCall?.functionCalls?.length) {
             console.log("🔧 Tool calls:", gm.toolCall.functionCalls.map(fc => fc.name));
             const functionResponses = [];
@@ -492,190 +488,3 @@ const PORT = process.env.PORT || 8080;
 server.listen(PORT, "0.0.0.0", () =>
   console.log(`🚀 Praxis Voice listening on ${PORT}, model=${LIVE_MODEL}`)
 );
-
-// -----------------------------------------------------------------------------
-// Simple voice test HTML (served at /voice)
-// -----------------------------------------------------------------------------
-const VOICE_HTML = `
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Praxis Voice Test</title>
-  <style>
-    body { font-family: system-ui, sans-serif; max-width: 760px; margin: 24px auto; }
-    input, button { padding: 8px; font-size: 14px; }
-    #log { white-space: pre-wrap; background: #111; color: #0f0; padding: 12px; height: 280px; overflow: auto; border-radius: 8px; }
-    .row { display:flex; gap:8px; margin-bottom:8px; align-items:center; }
-  </style>
-</head>
-<body>
-  <h2>Praxis Voice Live (WebSocket)</h2>
-
-  <div class="row">
-    <label>Email:</label>
-    <input id="email" placeholder="student@email.com" style="flex:1" />
-  </div>
-  <div class="row">
-    <label>LMS Key (optional):</label>
-    <input id="lmsKey" placeholder="MY_LMS_API_KEY" style="flex:1" />
-  </div>
-
-  <div class="row">
-    <button id="startBtn">Start</button>
-    <button id="stopBtn" disabled>Stop</button>
-  </div>
-
-  <h3>Log</h3>
-  <div id="log"></div>
-
-<script>
-(() => {
-  const logEl = document.getElementById('log');
-  const startBtn = document.getElementById('startBtn');
-  const stopBtn  = document.getElementById('stopBtn');
-  const emailEl  = document.getElementById('email');
-  const lmsKeyEl = document.getElementById('lmsKey');
-
-  let ws, audioCtx, micStream, processor;
-  let playTime = 0;
-
-  const log = (...args) => {
-    logEl.textContent += args.join(' ') + "\\n";
-    logEl.scrollTop = logEl.scrollHeight;
-  };
-
-  function base64FromArrayBuffer(ab) {
-    let binary = '';
-    const bytes = new Uint8Array(ab);
-    for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
-    return btoa(binary);
-  }
-
-  function arrayBufferFromBase64(b64) {
-    const binary = atob(b64);
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return bytes.buffer;
-  }
-
-  function floatTo16BitPCM(float32) {
-    const out = new Int16Array(float32.length);
-    for (let i = 0; i < float32.length; i++) {
-      let s = Math.max(-1, Math.min(1, float32[i]));
-      out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-    }
-    return out;
-  }
-
-  function downsampleBuffer(buffer, sampleRate, outRate = 16000) {
-    if (outRate === sampleRate) return buffer;
-    const ratio = sampleRate / outRate;
-    const newLen = Math.round(buffer.length / ratio);
-    const result = new Float32Array(newLen);
-    let offset = 0;
-    for (let i = 0; i < newLen; i++) {
-      const nextOffset = Math.round((i + 1) * ratio);
-      let sum = 0, count = 0;
-      for (let j = offset; j < nextOffset && j < buffer.length; j++) {
-        sum += buffer[j]; count++;
-      }
-      result[i] = sum / count;
-      offset = nextOffset;
-    }
-    return result;
-  }
-
-  async function startMic() {
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const source = audioCtx.createMediaStreamSource(micStream);
-
-    processor = audioCtx.createScriptProcessor(4096, 1, 1);
-    source.connect(processor);
-    processor.connect(audioCtx.destination);
-
-    processor.onaudioprocess = (e) => {
-      if (!ws || ws.readyState !== 1) return;
-      const input = e.inputBuffer.getChannelData(0);
-      const down = downsampleBuffer(input, audioCtx.sampleRate, 16000);
-      const pcm16 = floatTo16BitPCM(down);
-      ws.send(JSON.stringify({ type: "audio", data: base64FromArrayBuffer(pcm16.buffer) }));
-    };
-  }
-
-  function stopMic() {
-    if (processor) processor.disconnect();
-    if (micStream) micStream.getTracks().forEach(t => t.stop());
-    if (audioCtx) audioCtx.close();
-    processor = micStream = audioCtx = null;
-  }
-
-  function playPcm16(base64Pcm) {
-    const ab = arrayBufferFromBase64(base64Pcm);
-    const pcm16 = new Int16Array(ab);
-    const float32 = new Float32Array(pcm16.length);
-    for (let i = 0; i < pcm16.length; i++) float32[i] = pcm16[i] / 0x8000;
-
-    const buf = audioCtx.createBuffer(1, float32.length, 16000);
-    buf.copyToChannel(float32, 0);
-
-    const src = audioCtx.createBufferSource();
-    src.buffer = buf;
-    src.connect(audioCtx.destination);
-
-    const now = audioCtx.currentTime;
-    if (playTime < now) playTime = now;
-    src.start(playTime);
-    playTime += buf.duration;
-  }
-
-  startBtn.onclick = async () => {
-    const email = emailEl.value.trim();
-    if (!email) return log("Enter student email first.");
-
-    ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws");
-
-    ws.onopen = () => {
-      log("WS open.");
-      ws.send(JSON.stringify({
-        type:"start",
-        student_email: email,
-        lmsKey: lmsKeyEl.value.trim() || undefined
-      }));
-    };
-
-    ws.onmessage = async (e) => {
-      const msg = JSON.parse(e.data);
-
-      if (msg.type === "ready") {
-        log("Gemini ready. Starting mic...");
-        startBtn.disabled = true;
-        stopBtn.disabled = false;
-        await startMic();
-      }
-
-      if (msg.type === "text") log("AI:", msg.text);
-      if (msg.type === "audio") { if (audioCtx) playPcm16(msg.data); }
-      if (msg.type === "error") log("ERROR:", msg.error);
-    };
-
-    ws.onclose = () => {
-      log("WS closed.");
-      stopMic();
-      startBtn.disabled = false;
-      stopBtn.disabled = true;
-    };
-  };
-
-  stopBtn.onclick = () => {
-    if (ws && ws.readyState === 1) {
-      ws.send(JSON.stringify({ type:"stop" }));
-      ws.close();
-    }
-  };
-})();
-</script>
-</body>
-</html>
-`;
