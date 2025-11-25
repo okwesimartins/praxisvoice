@@ -178,8 +178,6 @@ function initSTT() {
       if (!transcript) continue;
 
       // ---- ECHO FILTER ----
-      // If transcript is long and fully contained in currentTtsText,
-      // it is almost certainly the AI's own voice, so ignore it.
       const words = transcript.split(/\s+/);
       if (
         currentTtsText &&
@@ -197,7 +195,6 @@ function initSTT() {
 
   recognition.onerror = (event) => {
     if (event.error === "no-speech" || event.error === "network") {
-      // benign, just restart if we want to keep listening
       console.log("STT benign error:", event.error);
       if (shouldKeepListening) {
         setTimeout(() => {
@@ -328,24 +325,11 @@ function startSession() {
     }
 
     if (msg.type === "ready") {
-      log("Session ready. Starting STT...");
+      log("Session ready. Start speaking when you're ready.");
       wsReady = true;
       shouldKeepListening = true;
       startListening();
-
-      // Ask Praxis for an intro (hidden user prompt)
-      const introPrompt =
-        "Introduce yourself as Praxis, my online tutor at Pluralcode Academy, in 2–3 spoken sentences. Do NOT use bullet points or markdown.";
-      const introId = "intro-" + makeRequestId();
-      lastRequestId = introId;
-      ws.send(
-        JSON.stringify({
-          type: "user_text",
-          text: introPrompt,
-          requestId: introId,
-        })
-      );
-
+      // ❌ REMOVED: automatic intro prompt
       return;
     }
 
