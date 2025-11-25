@@ -1,51 +1,67 @@
+// public/voice-app.js
+
+// Point this to your backend base URL (no /ws here)
 const BACKEND_URL = "https://veritas-ai-voice-156084498565.europe-west1.run.app";
 
 // DOM elements
-const emailInput = document.getElementById('email');
-const lmsKeyInput = document.getElementById('lmsKey');
-const startBtn = document.getElementById('startBtn');
-const stopBtn = document.getElementById('stopBtn');
-const transcriptEl = document.getElementById('transcript');
-const logsEl = document.getElementById('logs');
-const speakingIndicator = document.getElementById('speakingIndicator');
+const emailInput = document.getElementById("email");
+const lmsKeyInput = document.getElementById("lmsKey");
+const startBtn = document.getElementById("startBtn");
+const stopBtn = document.getElementById("stopBtn");
+const transcriptEl = document.getElementById("transcript");
+const logsEl = document.getElementById("logs");
+const speakingIndicator = document.getElementById("speakingIndicator");
 
 // State
 let ws = null;
 let audioCtx = null;
 let micStream = null;
 let processor = null;
-let playTime = 0;
+let playTime = 0; // no longer used for server audio, kept just in case
 let isConnected = false;
-let currentTranscript = '';
+let currentTranscript = "";
+let pendingUtteranceText = "";
+
+// SpeechSynthesis
+let selectedVoice = null;
+
+function initVoices() {
+  if (!window.speechSynthesis) return;
+  const voices = window.speechSynthesis.getVoices();
+  if (!voices || !voices.length) return;
+
+  // Try to pick a lighter, more "friendly" voice if possible
+  selectedVoice =
+    voices.find((v) =>
+      /female|Google UK English Female|Google US English/gim.test(v.name)
+    ) || voices[0];
+
+  console.log("🔊 Selected TTS voice:", selectedVoice?.name);
+}
+
+if ("speechSynthesis" in window) {
+  window.speechSynthesis.onvoiceschanged = initVoices;
+  initVoices();
+}
 
 // Logging
 function log(message, isError = false) {
   const timestamp = new Date().toLocaleTimeString();
-  const logEntry = document.createElement('div');
-  logEntry.className = `log-entry${isError ? ' error' : ''}`;
+  const logEntry = document.createElement("div");
+  logEntry.className = `log-entry${isError ? " error" : ""}`;
   logEntry.textContent = `[${timestamp}] ${message}`;
   logsEl.appendChild(logEntry);
   logsEl.scrollTop = logsEl.scrollHeight;
-  console.log(isError ? '[LOG:ERROR]' : '[LOG]', message);
 }
 
-// Audio encoding utilities
+// Audio encoding utilities (for mic → backend)
 function base64FromArrayBuffer(ab) {
-  let binary = '';
+  let binary = "";
   const bytes = new Uint8Array(ab);
   for (let i = 0; i < bytes.byteLength; i++) {
     binary += String.fromCharCode(bytes[i]);
   }
   return btoa(binary);
-}
-
-function arrayBufferFromBase64(b64) {
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes.buffer;
 }
 
 function floatTo16BitPCM(float32) {
@@ -63,10 +79,10 @@ function downsampleBuffer(buffer, sampleRate, outRate = 16000) {
   const newLen = Math.round(buffer.length / ratio);
   const result = new Float32Array(newLen);
   let offset = 0;
-  
   for (let i = 0; i < newLen; i++) {
     const nextOffset = Math.round((i + 1) * ratio);
-    let sum = 0, count = 0;
+    let sum = 0,
+      count = 0;
     for (let j = offset; j < nextOffset && j < buffer.length; j++) {
       sum += buffer[j];
       count++;
@@ -77,18 +93,18 @@ function downsampleBuffer(buffer, sampleRate, outRate = 16000) {
   return result;
 }
 
-// Microphone management
+// Microphone management (still sending audio to backend for STT)
 async function startMic() {
   try {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    micStream = await navigator.mediaDevices.getUserMedia({ 
+    micStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
         noiseSuppression: true,
-        autoGainControl: true
-      } 
+        autoGainControl: true,
+      },
     });
-    
+
     const source = audioCtx.createMediaStreamSource(micStream);
     processor = audioCtx.createScriptProcessor(4096, 1, 1);
     source.connect(processor);
@@ -100,13 +116,15 @@ async function startMic() {
       const down = downsampleBuffer(input, audioCtx.sampleRate, 16000);
       const pcm16 = floatTo16BitPCM(down);
       const buffer = pcm16.buffer;
-      ws.send(JSON.stringify({ 
-        type: "audio", 
-        data: base64FromArrayBuffer(buffer) 
-      }));
+      ws.send(
+        JSON.stringify({
+          type: "audio",
+          data: base64FromArrayBuffer(buffer),
+        })
+      );
     };
 
-    log('Microphone started');
+    log("Microphone started");
   } catch (error) {
     log(`Mic error: ${error.message}`, true);
   }
@@ -118,82 +136,82 @@ function stopMic() {
     processor = null;
   }
   if (micStream) {
-    micStream.getTracks().forEach(t => t.stop());
+    micStream.getTracks().forEach((t) => t.stop());
     micStream = null;
   }
-  if (audioCtx && audioCtx.state !== 'closed') {
+  if (audioCtx && audioCtx.state !== "closed") {
     audioCtx.close();
     audioCtx = null;
   }
-  log('Microphone stopped');
+  log("Microphone stopped");
 }
 
-// Audio playback with 1.2x speed
-function playPcm16(base64Pcm) {
-  if (!audioCtx) return;
-
-  try {
-    const ab = arrayBufferFromBase64(base64Pcm);
-    const pcm16 = new Int16Array(ab);
-    const float32 = new Float32Array(pcm16.length);
-    
-    for (let i = 0; i < pcm16.length; i++) {
-      float32[i] = pcm16[i] / 0x8000;
-    }
-
-    const targetRate = 16000 * 1.2;
-    const buf = audioCtx.createBuffer(1, float32.length, targetRate);
-    buf.copyToChannel(float32, 0);
-
-    const src = audioCtx.createBufferSource();
-    src.buffer = buf;
-    src.connect(audioCtx.destination);
-
-    const now = audioCtx.currentTime;
-    if (playTime < now) playTime = now;
-    src.start(playTime);
-    playTime += buf.duration;
-
-    speakingIndicator.classList.remove('hidden');
-    setTimeout(() => speakingIndicator.classList.add('hidden'), buf.duration * 1000);
-  } catch (error) {
-    log(`Audio error: ${error.message}`, true);
+// TTS: speak the AI answer (after turnComplete)
+function speakText(text) {
+  if (!("speechSynthesis" in window)) {
+    log("SpeechSynthesis not supported in this browser", true);
+    return;
   }
+  if (!text || !text.trim()) return;
+
+  // Cancel any previous speech to avoid queue piling up
+  window.speechSynthesis.cancel();
+
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.rate = 1.2; // faster
+  utterance.pitch = 1.1; // slightly higher, lighter
+  utterance.volume = 1.0;
+
+  if (selectedVoice) utterance.voice = selectedVoice;
+
+  utterance.onstart = () => {
+    speakingIndicator.classList.remove("hidden");
+  };
+  utterance.onend = () => {
+    speakingIndicator.classList.add("hidden");
+  };
+  utterance.onerror = (e) => {
+    speakingIndicator.classList.add("hidden");
+    log(`TTS error: ${e.error || "unknown"}`, true);
+  };
+
+  window.speechSynthesis.speak(utterance);
 }
 
 // WebSocket management
 function handleStart() {
   const email = emailInput.value.trim();
   if (!email) {
-    log('Please enter student email', true);
+    log("Please enter student email", true);
     return;
   }
 
-  currentTranscript = '';
-  transcriptEl.textContent = 'Transcript will appear here...';
-  log('Connecting to backend...');
+  currentTranscript = "";
+  pendingUtteranceText = "";
+  transcriptEl.textContent = "Transcript will appear here...";
+  logsEl.innerHTML = "";
+  log("Connecting to backend...");
 
-  const wsUrl = `${BACKEND_URL.replace('https://', 'wss://')}/ws`;
-  console.log("🔌 Connecting to WS:", wsUrl);
+  const wsUrl = `${BACKEND_URL.replace("https://", "wss://")}/ws`;
   ws = new WebSocket(wsUrl);
 
   ws.onopen = () => {
-    log('WebSocket connected');
-    console.log("📤 Sending start message");
-    ws.send(JSON.stringify({
-      type: "start",
-      student_email: email,
-      lmsKey: lmsKeyInput.value.trim() || undefined
-    }));
+    log("WebSocket connected");
+    ws.send(
+      JSON.stringify({
+        type: "start",
+        student_email: email,
+        lmsKey: lmsKeyInput.value.trim() || undefined,
+      })
+    );
   };
 
   ws.onmessage = async (e) => {
-    console.log("📥 Raw WS message:", e.data);
     const msg = JSON.parse(e.data);
-    console.log("📥 Parsed WS message:", msg);
+    console.log("🛰 WS message from backend:", msg);
 
     if (msg.type === "ready") {
-      log('Gemini ready - starting mic...');
+      log("Gemini ready - starting mic...");
       isConnected = true;
       startBtn.disabled = true;
       stopBtn.disabled = false;
@@ -203,41 +221,41 @@ function handleStart() {
     }
 
     if (msg.type === "text") {
-      console.log("📝 AI text chunk:", msg.text);
-      // Clear placeholder on first chunk
-      if (!currentTranscript || currentTranscript === 'Transcript will appear here...') {
-        currentTranscript = '';
-        transcriptEl.textContent = '';
-      }
-      currentTranscript += (currentTranscript ? ' ' : '') + msg.text;
+      // Update transcript and pending speech text
+      currentTranscript += msg.text;
+      pendingUtteranceText += msg.text;
+
       transcriptEl.textContent = currentTranscript;
       transcriptEl.scrollTop = transcriptEl.scrollHeight;
+
       log(`AI: ${msg.text}`);
     }
 
-    if (msg.type === "audio") {
-      console.log("🔊 Received audio chunk");
-      playPcm16(msg.data);
+    // No audio from server now – TTS happens in browser
+    // if (msg.type === "audio") { ... }
+
+    if (msg.type === "turnComplete") {
+      // Turn finished → speak the accumulated text
+      if (pendingUtteranceText.trim()) {
+        speakText(pendingUtteranceText);
+        pendingUtteranceText = "";
+      }
     }
 
     if (msg.type === "error") {
       log(`ERROR: ${msg.error}`, true);
     }
-
-    if (msg.type === "turnComplete") {
-      speakingIndicator.classList.add('hidden');
-    }
   };
 
-  ws.onerror = (event) => {
-    console.error("WS error event:", event);
-    log('WebSocket error', true);
+  ws.onerror = (err) => {
+    console.error("WS error:", err);
+    log("WebSocket error", true);
   };
 
   ws.onclose = () => {
-    log('Session ended');
+    log("Session ended");
     stopMic();
-    speakingIndicator.classList.add('hidden');
+    speakingIndicator.classList.add("hidden");
     isConnected = false;
     startBtn.disabled = false;
     stopBtn.disabled = true;
@@ -251,15 +269,18 @@ function handleStop() {
     ws.send(JSON.stringify({ type: "stop" }));
     ws.close();
   }
-  log('Stopping session...');
+  log("Stopping session...");
 }
 
 // Event listeners
-startBtn.addEventListener('click', handleStart);
-stopBtn.addEventListener('click', handleStop);
+startBtn.addEventListener("click", handleStart);
+stopBtn.addEventListener("click", handleStop);
 
 // Cleanup on page unload
-window.addEventListener('beforeunload', () => {
+window.addEventListener("beforeunload", () => {
   if (ws) ws.close();
   stopMic();
+  if ("speechSynthesis" in window) {
+    window.speechSynthesis.cancel();
+  }
 });
