@@ -17,6 +17,9 @@ const transcriptEl = document.getElementById("transcript");
 const logsEl = document.getElementById("logs");
 const speakingIndicator = document.getElementById("speakingIndicator");
 
+const resourcesEl = document.getElementById("resources");
+const quizContainer = document.getElementById("quizContainer");
+
 // ================= STATE =================
 
 let ws = null;
@@ -52,7 +55,7 @@ function setUiState() {
   startBtn.disabled = sessionActive;
   stopBtn.disabled = !sessionActive;
 
-  // Talk is only enabled when session is active and WS ready
+  // Talk is only enabled when session is active, WS ready, and not currently listening
   talkBtn.disabled = !sessionActive || !wsReady || recognizing;
 }
 
@@ -71,6 +74,160 @@ function addTranscriptLine(role, text) {
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
+// ================= QUIZ HELPERS =================
+
+function extractQuizDefinition(fullText) {
+  const match = fullText.match(
+    /\[QUIZ_JSON_START\]([\s\S]+?)\[QUIZ_JSON_END\]/
+  );
+  if (!match) return null;
+  try {
+    const json = match[1].trim();
+    const quiz = JSON.parse(json);
+    if (!quiz || !Array.isArray(quiz.questions)) return null;
+    return quiz;
+  } catch (e) {
+    console.error("Failed to parse quiz JSON:", e);
+    return null;
+  }
+}
+
+function stripQuizJson(fullText) {
+  return fullText
+    .replace(/\[QUIZ_JSON_START\][\s\S]+?\[QUIZ_JSON_END\]/, "")
+    .trim();
+}
+
+function renderQuiz(quizDef) {
+  quizContainer.innerHTML = "";
+
+  if (!quizDef || !Array.isArray(quizDef.questions) || !quizDef.questions.length) {
+    const p = document.createElement("p");
+    p.textContent = "Quiz format error. Try asking Praxis for another quiz.";
+    quizContainer.appendChild(p);
+    return;
+  }
+
+  const intro = document.createElement("p");
+  intro.textContent = "Quiz loaded. Answer the questions and click Submit to see your score.";
+  quizContainer.appendChild(intro);
+
+  quizDef.questions.forEach((q, idx) => {
+    const qDiv = document.createElement("div");
+    qDiv.className = "quiz-question";
+
+    const qText = document.createElement("p");
+    qText.textContent = `${idx + 1}. ${q.q}`;
+    qDiv.appendChild(qText);
+
+    if (!Array.isArray(q.options)) q.options = [];
+
+    q.options.forEach((opt, optIdx) => {
+      const label = document.createElement("label");
+      label.className = "quiz-option";
+
+      const radio = document.createElement("input");
+      radio.type = "radio";
+      radio.name = `quiz_q_${idx}`;
+      radio.value = String(optIdx);
+
+      label.appendChild(radio);
+      label.appendChild(document.createTextNode(" " + opt));
+      qDiv.appendChild(label);
+    });
+
+    quizContainer.appendChild(qDiv);
+  });
+
+  const submitBtn = document.createElement("button");
+  submitBtn.textContent = "Submit Quiz";
+  submitBtn.className = "btn btn-primary quiz-submit-btn";
+
+  const resultP = document.createElement("p");
+  resultP.className = "quiz-result";
+
+  submitBtn.addEventListener("click", () => {
+    let correct = 0;
+    const total = quizDef.questions.length;
+
+    quizDef.questions.forEach((q, idx) => {
+      const selected = quizContainer.querySelector(
+        `input[name="quiz_q_${idx}"]:checked`
+      );
+      if (!selected) return;
+      const chosen = Number(selected.value);
+      if (Number(q.answerIndex) === chosen) correct++;
+    });
+
+    resultP.textContent = `You scored ${correct} out of ${total}.`;
+  });
+
+  quizContainer.appendChild(submitBtn);
+  quizContainer.appendChild(resultP);
+}
+
+// ================= RESOURCES / YOUTUBE =================
+
+function extractLinks(text) {
+  return text.match(/https?:\/\/\S+/gi) || [];
+}
+
+function extractYouTubeId(url) {
+  try {
+    const u = new URL(url);
+    if (u.hostname.includes("youtu.be")) {
+      return u.pathname.replace("/", "");
+    }
+    if (u.hostname.includes("youtube.com")) {
+      return u.searchParams.get("v");
+    }
+  } catch (e) {
+    return null;
+  }
+  return null;
+}
+
+function renderResourcesFromText(text) {
+  const links = extractLinks(text);
+  if (!links.length) return;
+
+  // Remove placeholder if it's still there
+  const placeholder = resourcesEl.querySelector(".placeholder");
+  if (placeholder) {
+    placeholder.remove();
+  }
+
+  links.forEach((url) => {
+    const card = document.createElement("div");
+    card.className = "resource-card";
+
+    const linkEl = document.createElement("a");
+    linkEl.href = url;
+    linkEl.target = "_blank";
+    linkEl.rel = "noopener noreferrer";
+    linkEl.textContent = url;
+    card.appendChild(linkEl);
+
+    // If YouTube link, embed preview
+    if (/youtube\.com\/watch|youtu\.be\//i.test(url)) {
+      const videoId = extractYouTubeId(url);
+      if (videoId) {
+        const iframe = document.createElement("iframe");
+        iframe.src = `https://www.youtube.com/embed/${videoId}`;
+        iframe.allow =
+          "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture";
+        iframe.allowFullscreen = true;
+        iframe.loading = "lazy";
+        iframe.width = "100%";
+        iframe.height = "200";
+        card.appendChild(iframe);
+      }
+    }
+
+    resourcesEl.appendChild(card);
+  });
+}
+
 // ================= TTS: SPEECH SYNTHESIS =================
 
 function sanitizeForSpeech(fullText) {
@@ -78,10 +235,17 @@ function sanitizeForSpeech(fullText) {
 
   let text = fullText;
 
-  // Strip markdown bullets / formatting
-  text = text.replace(/[*_`>#\-]+/g, " ");
+  // Remove any quiz JSON if somehow still present
+  text = stripQuizJson(text);
 
-  // Try to drop explicit "Links:" / "Resources:" sections from speech
+  // Strip markdown bullets / formatting symbols
+  text = text.replace(/[*_`>#]+/g, " ");
+
+  // Remove comment-like slashes and bracket-ish characters
+  text = text.replace(/\/\/+/g, " ");
+  text = text.replace(/[{}\[\]()/\\|~^]+/g, " ");
+
+  // Try to drop "Links:" / "Resources:" sections from speech
   const linksIndex = text.search(/(links:|resources:)/i);
   if (linksIndex !== -1) {
     text = text.slice(0, linksIndex);
@@ -103,13 +267,28 @@ function pickNiceVoice() {
   const allVoices = window.speechSynthesis.getVoices();
   if (!allVoices || !allVoices.length) return null;
 
-  // Prefer Google voices (usually more natural)
-  const googleVoice =
-    allVoices.find((v) =>
-      /Google US English|Google UK English/i.test(v.name)
-    ) || allVoices.find((v) => /Google/i.test(v.name));
+  // Try to bias towards male-ish voices by name
+  const preferredNamePatterns = [
+    /male/i,
+    /\bDavid\b/i,
+    /\bDaniel\b/i,
+    /\bAlex\b/i,
+    /\bGeorge\b/i,
+    /\bTom\b/i,
+  ];
 
-  return googleVoice || allVoices[0];
+  let preferred = allVoices.find((v) =>
+    preferredNamePatterns.some((rx) => rx.test(v.name))
+  );
+
+  if (!preferred) {
+    preferred =
+      allVoices.find((v) => /Google US English\b/i.test(v.name)) ||
+      allVoices.find((v) => /Google UK English\b/i.test(v.name)) ||
+      allVoices.find((v) => /Google/i.test(v.name));
+  }
+
+  return preferred || allVoices[0];
 }
 
 function speakText(fullText) {
@@ -126,11 +305,10 @@ function speakText(fullText) {
 
   const utterance = new SpeechSynthesisUtterance(spoken);
 
-  // Slightly slower than default, normal pitch
+  // Slightly slower, normal pitch
   utterance.rate = 0.9;
   utterance.pitch = 1.0;
 
-  // Load voices if needed
   if (voicesLoaded) {
     const voice = pickNiceVoice();
     if (voice) utterance.voice = voice;
@@ -180,7 +358,7 @@ function initSTT() {
   recognition = new SpeechRecognition();
   recognition.lang = "en-US";
   recognition.continuous = false;      // one utterance per click
-  recognition.interimResults = false;  // we only care about final result
+  recognition.interimResults = false;  // only final result
 
   recognition.onstart = () => {
     recognizing = true;
@@ -277,6 +455,11 @@ function startSession() {
 
   transcriptEl.textContent = "Transcript will appear here...";
   logsEl.textContent = "";
+  resourcesEl.innerHTML =
+    '<p class="placeholder">Links and YouTube previews will appear here when Praxis shares resources.</p>';
+  quizContainer.innerHTML =
+    '<p class="placeholder">No quiz yet. Ask Praxis to test you with a short quiz.</p>';
+
   conversationHistory = [];
   wsReady = false;
   sessionActive = true;
@@ -314,9 +497,9 @@ function startSession() {
       wsReady = true;
       setUiState();
 
-      // Optional: ask Praxis to introduce itself (one-time)
+      // Optional: ask Praxis to introduce himself
       const introPrompt =
-        "Introduce yourself as Praxis, my online tutor at Pluralcode Academy, in 2-3 short spoken sentences. Do NOT use bullet points or markdown.";
+        "Introduce yourself as Praxis, my male online tutor at Pluralcode Academy, in 2-3 short spoken sentences. Do NOT use bullet points or markdown.";
       const introId = "intro-" + makeRequestId();
       lastRequestId = introId;
       ws.send(
@@ -330,12 +513,26 @@ function startSession() {
     }
 
     if (msg.type === "assistant_text") {
-      // Optionally ignore stale requestIds if you want; here it's simple
-      const aiText = msg.text || "";
+      const fullText = msg.text || "";
+
+      // Extract quiz if present
+      const quizDef = extractQuizDefinition(fullText);
+      if (quizDef) {
+        renderQuiz(quizDef);
+      }
+
+      // Strip quiz JSON for display & speech
+      const displayText = stripQuizJson(fullText);
+
       log("Praxis replied.");
-      addTranscriptLine("assistant", aiText);
-      conversationHistory.push({ role: "assistant", text: aiText });
-      speakText(aiText);
+      addTranscriptLine("assistant", displayText);
+      conversationHistory.push({ role: "assistant", text: displayText });
+
+      // Render resources (YouTube previews, links)
+      renderResourcesFromText(displayText);
+
+      // Speak explanation only (no quiz / weird characters)
+      speakText(displayText);
       return;
     }
 

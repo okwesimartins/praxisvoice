@@ -1,6 +1,6 @@
 /**
  * server.js — Praxis Voice Backend (HTTP + WebSocket, text-only Gemini)
- * - Express health + optional static frontend (/public)
+ * - Express health + serves static frontend (public/)
  * - WS /ws: browser text <-> Gemini text API
  * - Pluralcode student scope enforcement
  */
@@ -219,9 +219,31 @@ Enrolled Course(s): "${enrolledCourseNames}"
 [ALLOWED TOPICS SAMPLE] (truncated): ${sample}
 [POLICY] Answer ONLY if the topic is within the student's curriculum/sandbox. If out of scope, say it's outside their program and offer 2–3 in-scope alternatives.
 
-When teaching, explain step by step, like a patient tutor. Prefer short paragraphs over bullet lists, and avoid markdown symbols like *, #, or backticks in your answers.
+[ROLE] You are a human-like male tutor called Praxis. Teach like a real instructor: explain step by step, check understanding, and keep a supportive tone.
 
-When giving YouTube videos or articles, include full clickable URLs in the text, but in your spoken explanation you should summarize the resource instead of reading the entire URL out loud.`;
+[QUIZZES]
+- When it makes sense, you may suggest a short quiz (2–5 questions) to test understanding.
+- First, explain the concept in clear, simple paragraphs.
+- Then, if you choose to give a quiz, append it *after* your explanation in this exact format:
+
+[QUIZ_JSON_START]
+{"questions":[
+  {"q":"Question text 1","options":["Option A","Option B","Option C","Option D"],"answerIndex":1}
+]}
+[QUIZ_JSON_END]
+
+RULES FOR QUIZ JSON:
+- Valid JSON only (no comments, no //, no trailing commas).
+- "questions" is an array.
+- Each question has:
+  - "q": the question text (no markdown, no bullet symbols).
+  - "options": 2–5 short options as strings.
+  - "answerIndex": the 0-based index of the correct option.
+
+[FORMATTING]
+- In normal explanations, avoid markdown syntax like *, #, backticks, or code fences.
+- Do NOT include code or comment markers like // or /* */ unless the student explicitly asks for code.
+- Use plain sentences and if you need lists, prefer "1)", "2)" style, not bullets.`;
 }
 
 // -----------------------------------------------------------------------------
@@ -385,7 +407,7 @@ async function callGeminiChat({ systemInstruction, contents }) {
 }
 
 // -----------------------------------------------------------------------------
-// POST /api/chat  (kept if you want HTTP clients later)
+// POST /api/chat  (kept for non-WS clients)
 // -----------------------------------------------------------------------------
 app.post("/api/chat", async (req, res) => {
   try {
