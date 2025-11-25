@@ -1,8 +1,15 @@
 // =======================
 // CONFIG
 // =======================
-const API_BASE = ""; // "" = same origin as server.js. Or e.g. "https://your-backend-url"
-const CHAT_PATH = "/api/praxis/text"; // backend route that talks to Gemini
+
+// If frontend is served by the same backend, leave API_BASE empty ("").
+// If you host the HTML elsewhere, set it to your Cloud Run URL like:
+// const API_BASE = "https://veritas-ai-voice-156084498565.europe-west1.run.app";
+const API_BASE = "";
+
+// Build WS URL from API_BASE or current origin
+const WS_BASE = API_BASE || window.location.origin;
+const WS_URL = WS_BASE.replace(/^http/, "ws") + "/ws";
 
 // =======================
 // DOM ELEMENTS
@@ -18,13 +25,15 @@ const speakingIndicator = document.getElementById("speakingIndicator");
 // =======================
 // STATE
 // =======================
+let ws = null;
+
 let recognition = null;
 let recognizing = false;
 let sessionActive = false;
 
 let selectedVoice = null;
-let isSending = false; // avoid overlapping requests
-let conversation = []; // simple array of {role, text}
+let isSending = false;
+let conversation = []; // [{role:"user"|"assistant", text}]
 
 // =======================
 // LOGGING
@@ -61,12 +70,12 @@ function renderTranscript() {
 }
 
 // =======================
-// BROWSER TTS (SPEECHSYNTHESIS)
+// BROWSER TTS (speechSynthesis)
 // =======================
 function pickBestVoice() {
   const voices = window.speechSynthesis.getVoices();
   if (!voices || !voices.length) {
-    console.log("No TTS voices available (yet).");
+    console.log("No TTS voices available yet.");
     return;
   }
 
@@ -83,24 +92,22 @@ function pickBestVoice() {
   console.log("Selected voice:", selectedVoice && selectedVoice.name);
 }
 
-// Load voices (async in some browsers)
 window.speechSynthesis.onvoiceschanged = pickBestVoice;
 pickBestVoice();
 
-// Speak AI text
-function speakText(text) {
-  if (!sessionActive || !text) return;
+function speakText(fullText) {
+  if (!sessionActive || !fullText) return;
 
-  // Cancel any ongoing speech
+  // Don't make the browser read full URLs
+  const speakable = fullText.replace(/https?:\/\/\S+/g, "a link I found");
+
   window.speechSynthesis.cancel();
-
-  const utterance = new SpeechSynthesisUtterance(text);
+  const utterance = new SpeechSynthesisUtterance(speakable);
 
   if (selectedVoice) {
     utterance.voice = selectedVoice;
   }
 
-  // Tweak to sound less robotic
   utterance.rate = 1.1;   // slightly faster
   utterance.pitch = 1.05; // slightly brighter
   utterance.volume = 1.0;
@@ -113,7 +120,6 @@ function speakText(text) {
   utterance.onend = () => {
     speakingIndicator.classList.add("hidden");
     log("Praxis finished speaking.");
-    // Go back to listening (barge-in style)
     if (sessionActive) {
       startListening();
     }
@@ -131,7 +137,7 @@ function speakText(text) {
 }
 
 // =======================
-// BROWSER STT (SPEECHRECOGNITION)
+// BROWSER STT (SpeechRecognition)
 // =======================
 function setupRecognition() {
   const SpeechRecognition =
@@ -139,16 +145,14 @@ function setupRecognition() {
 
   if (!SpeechRecognition) {
     log("SpeechRecognition not supported in this browser.", true);
-    alert(
-      "Your browser does not support voice recognition. Please use Chrome or Edge."
-    );
+    alert("Your browser does not support voice recognition. Use Chrome or Edge.");
     return;
   }
 
   recognition = new SpeechRecognition();
   recognition.lang = "en-US";
-  recognition.continuous = false; // single utterance per turn
-  recognition.interimResults = true; // show partials
+  recognition.continuous = false; // one turn at a time
+  recognition.interimResults = true;
 
   recognition.onstart = () => {
     recognizing = true;
@@ -158,7 +162,6 @@ function setupRecognition() {
   recognition.onend = () => {
     recognizing = false;
     log("Stopped listening.");
-    // We don't restart here automatically; we restart after AI finishes talking
   };
 
   recognition.onerror = (event) => {
@@ -182,11 +185,11 @@ function setupRecognition() {
       }
     }
 
-    // Show interim text live (as user speaks)
+    // Show interim text as user is talking
     if (interimText) {
-      const tempConv = [...conversation, { role: "user", text: interimText }];
+      const temp = [...conversation, { role: "user", text: interimText }];
       transcriptEl.innerHTML = "";
-      tempConv.forEach((turn) => {
+      temp.forEach((turn) => {
         const p = document.createElement("p");
         p.className = `turn turn-${turn.role}`;
         const label = turn.role === "user" ? "You" : "Praxis";
@@ -196,7 +199,6 @@ function setupRecognition() {
       transcriptEl.scrollTop = transcriptEl.scrollHeight;
     }
 
-    // Once we get final text, send to backend
     if (finalText.trim()) {
       handleUserText(finalText.trim());
     }
@@ -205,12 +207,9 @@ function setupRecognition() {
 
 function startListening() {
   if (!sessionActive) return;
-  if (!recognition) {
-    setupRecognition();
-  }
-  if (!recognition) return; // still unsupported
+  if (!recognition) setupRecognition();
+  if (!recognition) return;
 
-  // If currently speaking, stop TTS and start listening
   if (window.speechSynthesis.speaking) {
     window.speechSynthesis.cancel();
   }
@@ -218,7 +217,6 @@ function startListening() {
   try {
     recognition.start();
   } catch (e) {
-    // Ignore "already started" errors
     console.log("Recognition start error:", e.message);
   }
 }
@@ -230,17 +228,13 @@ function stopListening() {
 }
 
 // =======================
-// BACKEND CALL
+// WS CALL
 // =======================
-async function sendToBackend(text) {
-  const email = emailInput.value.trim();
-  const lmsKey = lmsKeyInput.value.trim() || undefined;
-
-  if (!email) {
-    log("Missing student email.", true);
+function sendToBackend(text) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    log("WebSocket not open.", true);
     return;
   }
-
   if (isSending) {
     log("Still waiting for previous reply, skipping...", true);
     return;
@@ -248,67 +242,20 @@ async function sendToBackend(text) {
 
   isSending = true;
   log(`Sending to backend: "${text}"`);
-
-  try {
-    const res = await fetch(API_BASE + CHAT_PATH, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        text,
-        student_email: email,
-        lmsKey,
-      }),
-    });
-
-    if (!res.ok) {
-      const msg = await res.text();
-      throw new Error(`HTTP ${res.status}: ${msg}`);
-    }
-
-    const data = await res.json();
-
-    const replyText = data.reply || "(No reply text)";
-    log(`Praxis reply: ${replyText}`);
-
-    // Add AI reply to conversation
-    conversation.push({ role: "assistant", text: replyText });
-
-    // If backend also returns links (e.g. YouTube / articles), render them nicely
-    if (Array.isArray(data.links) && data.links.length) {
-      const linksText = data.links
-        .map((l, idx) => `${idx + 1}. ${l.title || l.link || ""}`)
-        .join("\n");
-      conversation.push({
-        role: "assistant",
-        text: `Here are some resources:\n${linksText}`,
-      });
-    }
-
-    renderTranscript();
-    speakText(replyText);
-  } catch (err) {
-    log(`Backend error: ${err.message}`, true);
-    if (sessionActive) {
-      // Try listening again
-      setTimeout(() => startListening(), 1000);
-    }
-  } finally {
-    isSending = false;
-  }
+  ws.send(
+    JSON.stringify({
+      type: "user_text",
+      text,
+    })
+  );
 }
 
-// When STT confirms user text
+// When STT final text is ready
 function handleUserText(text) {
-  // Commit user text to conversation
   conversation.push({ role: "user", text });
   renderTranscript();
 
-  // Pause listening while we get + speak AI reply
   stopListening();
-
-  // Ask backend
   sendToBackend(text);
 }
 
@@ -322,7 +269,7 @@ function handleStart() {
     return;
   }
 
-  sessionActive = true;
+  sessionActive = false; // will flip true on "ready"
   conversation = [];
   renderTranscript();
 
@@ -331,8 +278,75 @@ function handleStart() {
   emailInput.disabled = true;
   lmsKeyInput.disabled = true;
 
-  log("Session started. Say something!");
-  startListening();
+  log(`Connecting to WS: ${WS_URL}`);
+  ws = new WebSocket(WS_URL);
+
+  ws.onopen = () => {
+    log("WebSocket connected, sending start...");
+    ws.send(
+      JSON.stringify({
+        type: "start",
+        student_email: email,
+        lmsKey: lmsKeyInput.value.trim() || undefined,
+      })
+    );
+  };
+
+  ws.onmessage = (event) => {
+    let msg;
+    try {
+      msg = JSON.parse(event.data);
+    } catch (e) {
+      console.error("Bad WS message:", event.data);
+      return;
+    }
+
+    if (msg.type === "ready") {
+      log("Backend ready. You can start speaking.");
+      sessionActive = true;
+      isSending = false;
+      startListening();
+      return;
+    }
+
+    if (msg.type === "assistant_text") {
+      const reply = msg.text || "";
+      isSending = false;
+
+      conversation.push({ role: "assistant", text: reply });
+      renderTranscript();
+      speakText(reply);
+      return;
+    }
+
+    if (msg.type === "error") {
+      log(`ERROR: ${msg.error}`, true);
+      isSending = false;
+      if (sessionActive) {
+        setTimeout(() => startListening(), 1000);
+      }
+      return;
+    }
+  };
+
+  ws.onerror = (event) => {
+    console.error("WS error:", event);
+    log("WebSocket error", true);
+  };
+
+  ws.onclose = () => {
+    log("WebSocket closed / session ended");
+    sessionActive = false;
+    isSending = false;
+    stopListening();
+    window.speechSynthesis.cancel();
+    speakingIndicator.classList.add("hidden");
+
+    startBtn.disabled = false;
+    stopBtn.disabled = true;
+    emailInput.disabled = false;
+    lmsKeyInput.disabled = false;
+  };
 }
 
 function handleStop() {
@@ -340,10 +354,10 @@ function handleStop() {
   stopListening();
   window.speechSynthesis.cancel();
 
-  startBtn.disabled = false;
-  stopBtn.disabled = true;
-  emailInput.disabled = false;
-  lmsKeyInput.disabled = false;
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ type: "stop" }));
+    ws.close();
+  }
 
   speakingIndicator.classList.add("hidden");
   log("Session stopped.");
@@ -357,6 +371,7 @@ stopBtn.addEventListener("click", handleStop);
 
 window.addEventListener("beforeunload", () => {
   sessionActive = false;
+  if (ws) ws.close();
   stopListening();
   window.speechSynthesis.cancel();
 });

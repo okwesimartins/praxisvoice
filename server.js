@@ -1,8 +1,9 @@
 /**
- * server.js — Praxis Voice Backend (HTTP, no WebSockets)
+ * server.js — Praxis Voice Backend (HTTP + WebSocket, text-only Gemini)
  * - Express health + serves static frontend (public/)
- * - POST /api/chat: browser text <-> Gemini text API
- * - Pluralcode student scope enforcement (same as before)
+ * - POST /api/chat: HTTP text endpoint
+ * - WS /ws: browser text <-> Gemini text API (for voice UI)
+ * - Pluralcode student scope enforcement
  */
 
 if (process.env.NODE_ENV !== "production") {
@@ -15,6 +16,7 @@ const cors = require("cors");
 const path = require("path");
 const crypto = require("crypto");
 const { google } = require("googleapis");
+const WebSocket = require("ws");
 
 // ---- fetch polyfill (Node < 18) ----
 let fetchFn = global.fetch;
@@ -39,7 +41,7 @@ app.use(express.json());
 
 // Health endpoints
 app.get("/", (req, res) =>
-  res.json({ status: "ok", service: "Praxis Voice API (HTTP)" })
+  res.json({ status: "ok", service: "Praxis Voice API (HTTP+WS)" })
 );
 app.get("/health", (req, res) => res.json({ status: "healthy" }));
 
@@ -215,13 +217,13 @@ function buildContextHeader(studentEmail, enrolledCourseNames, allowedPhrases) {
 Student Email: ${studentEmail}
 Enrolled Course(s): "${enrolledCourseNames}"
 [ALLOWED TOPICS SAMPLE] (truncated): ${sample}
-[POLICY] Answer ONLY if the topic is within the student's curriculum/sandbox. If out of scope, briefly say it's outside their program and offer 2–3 in-scope alternatives.
+[POLICY] Answer ONLY if the topic is within the student's curriculum/sandbox. If out of scope, say it's outside their program and offer 2–3 in-scope alternatives.
 
 When giving YouTube videos or articles, include full clickable links in the text response. Avoid reading out full URLs; just describe them briefly in natural language.`;
 }
 
 // -----------------------------------------------------------------------------
-// (Optional) Google search tools - left here if you want later function-calling
+// (Optional) Google search tools - still available if you want to wire later
 // -----------------------------------------------------------------------------
 const Google_Search_API_KEY = process.env.Google_Search_API_KEY;
 const Google_Search_CX_ID = process.env.Google_Search_CX_ID;
@@ -319,7 +321,6 @@ if (!GEMINI_API_KEY) {
 }
 
 const RAW_MODEL = process.env.GEMINI_MODEL || "models/gemini-2.0-flash-exp";
-// Ensure format models/...
 const GEMINI_MODEL = RAW_MODEL.startsWith("models/")
   ? RAW_MODEL
   : `models/${RAW_MODEL}`;
@@ -384,7 +385,7 @@ async function callGeminiChat({ systemInstruction, contents }) {
 }
 
 // -----------------------------------------------------------------------------
-// POST /api/chat  (front-end sends student_email, message, history)
+// POST /api/chat  (kept for non-WS clients)
 // -----------------------------------------------------------------------------
 app.post("/api/chat", async (req, res) => {
   try {
@@ -396,12 +397,10 @@ app.post("/api/chat", async (req, res) => {
       });
     }
 
-    // Optional LMS key gate
     if (lmsKey && lmsKey !== process.env.MY_LMS_API_KEY) {
       return res.status(403).json({ error: "Invalid LMS key." });
     }
 
-    // Enforce scope
     const studentEmail = normalizeEmail(student_email);
     const scope = await getStudentScope(studentEmail);
     const enrolledCourseNames = scope.courseNames.join(", ");
@@ -414,10 +413,8 @@ app.post("/api/chat", async (req, res) => {
     );
     const systemInstruction = `${BASE_SYSTEM_INSTRUCTION}\n\n${header}`;
 
-    // Build conversation contents
     const contents = [];
 
-    // History from the client: [{ role: "user"|"assistant", text }]
     if (Array.isArray(history)) {
       for (const h of history) {
         if (!h || !h.text) continue;
@@ -430,7 +427,6 @@ app.post("/api/chat", async (req, res) => {
       }
     }
 
-    // Current user message
     contents.push({
       role: "user",
       parts: [{ text: message }],
@@ -449,10 +445,142 @@ app.post("/api/chat", async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// HTTP server
+// WebSocket /ws — text chat for voice UI
 // -----------------------------------------------------------------------------
 const server = http.createServer(app);
+const wss = new WebSocket.Server({ server, path: "/ws" });
+
+wss.on("connection", (ws) => {
+  ws.id = crypto.randomUUID();
+  ws.session = null;
+
+  console.log("WS client connected:", ws.id);
+
+  ws.on("message", async (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch (e) {
+      console.error("Bad WS JSON:", e);
+      return;
+    }
+
+    if (msg.type === "start") {
+      try {
+        const studentEmail = normalizeEmail(msg.student_email);
+        const scope = await getStudentScope(studentEmail);
+        const enrolledCourseNames = scope.courseNames.join(", ");
+        const allowedPhrases = scope.allowedPhrases;
+
+        const header = buildContextHeader(
+          studentEmail,
+          enrolledCourseNames,
+          allowedPhrases
+        );
+        const systemInstruction = `${BASE_SYSTEM_INSTRUCTION}\n\n${header}`;
+
+        ws.session = {
+          studentEmail,
+          lmsKey: msg.lmsKey,
+          systemInstruction,
+          history: [],
+        };
+
+        ws.send(JSON.stringify({ type: "ready" }));
+      } catch (err) {
+        console.error("WS start error:", err);
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            error: err.message || "Failed to start session",
+          })
+        );
+        ws.close();
+      }
+      return;
+    }
+
+    if (!ws.session) {
+      ws.send(
+        JSON.stringify({
+          type: "error",
+          error: "Session not initialized. Send a 'start' message first.",
+        })
+      );
+      return;
+    }
+
+    if (msg.type === "user_text") {
+      const text = String(msg.text || "").trim();
+      if (!text) return;
+
+      if (
+        ws.session.lmsKey &&
+        ws.session.lmsKey !== process.env.MY_LMS_API_KEY
+      ) {
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            error: "Invalid LMS key.",
+          })
+        );
+        return;
+      }
+
+      ws.session.history.push({ role: "user", text });
+
+      const contents = ws.session.history.map((h) => ({
+        role: h.role === "assistant" ? "model" : "user",
+        parts: [{ text: h.text }],
+      }));
+
+      try {
+        const aiText = await callGeminiChat({
+          systemInstruction: ws.session.systemInstruction,
+          contents,
+        });
+
+        ws.session.history.push({ role: "assistant", text: aiText });
+
+        ws.send(
+          JSON.stringify({
+            type: "assistant_text",
+            text: aiText,
+          })
+        );
+      } catch (err) {
+        console.error("WS chat error:", err);
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            error: err.message || "Gemini error",
+          })
+        );
+      }
+      return;
+    }
+
+    if (msg.type === "stop") {
+      ws.close();
+      return;
+    }
+  });
+
+  ws.on("close", () => {
+    console.log("WS client disconnected:", ws.id);
+  });
+
+  ws.on("error", (e) => {
+    console.error("WS error:", e);
+  });
+});
+
+// -----------------------------------------------------------------------------
+// HTTP server
+// -----------------------------------------------------------------------------
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, "0.0.0.0", () =>
-  console.log(`🚀 Praxis Voice HTTP listening on ${PORT}, model=${GEMINI_MODEL}`)
+  console.log(
+    `🚀 Praxis Voice HTTP+WS listening on ${PORT}, model=${GEMINI_MODEL}`
+  )
 );
