@@ -290,7 +290,7 @@ const validateUrl = async (url) => {
     return true;
   if (!isLikelyGoodUrl(url)) return false;
   try {
-    const res = await withTimeout(fetch(url, { method: "HEAD" }), 3500);
+    const res = await withTimeout(fetch(url), 3500, "URL HEAD timeout");
     if (res.ok || (res.status >= 300 && res.status < 400)) return true;
   } catch (_) {
     try {
@@ -591,7 +591,7 @@ app.post("/api/chat", async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// WebSocket /ws — text chat for voice UI (with Google TTS audio)
+// WebSocket /ws — text chat for voice UI (with Google TTS audio) + ping keepalive
 // -----------------------------------------------------------------------------
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/ws" });
@@ -601,6 +601,19 @@ wss.on("connection", (ws) => {
   ws.session = null;
 
   console.log("WS client connected:", ws.id);
+
+  // --- Keep WebSocket alive with ping frames ---
+  const pingInterval = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) {
+      try {
+        ws.ping();
+      } catch (e) {
+        console.error("WS ping error:", e);
+      }
+    } else {
+      clearInterval(pingInterval);
+    }
+  }, 30000);
 
   ws.on("message", async (raw) => {
     let msg;
@@ -726,10 +739,12 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     console.log("WS client disconnected:", ws.id);
+    clearInterval(pingInterval);
   });
 
   ws.on("error", (e) => {
     console.error("WS error:", e);
+    clearInterval(pingInterval);
   });
 });
 
