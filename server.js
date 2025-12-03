@@ -78,7 +78,9 @@ function extractMeetingLink(ev) {
 app.get("/calendar-events", async (req, res) => {
   try {
     const { email, calendarId } = req.query;
-
+         if (req.headers['x-api-key'] !== process.env.MY_LMS_API_KEY) {
+      return res.status(401).json({ error: 'Unauthorized' });
+    }
     if (!email || !calendarId) {
       return res
         .status(400)
