@@ -17,6 +17,8 @@ const WebSocket = require("ws");
 const crypto = require("crypto");
 const { google } = require("googleapis");
 const textToSpeech = require("@google-cloud/text-to-speech");
+const { getEventsForStudent } = require("./googleCalendar")
+
 
 // ---- fetch polyfill (Node < 18) ----
 let fetchFn = global.fetch;
@@ -55,6 +57,61 @@ app.get("/voice", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "voice-app.html"));
 });
 
+function extractMeetingLink(ev) {
+  // Older field for Google Meet
+  if (ev.hangoutLink) return ev.hangoutLink;
+
+  const conf = ev.conferenceData;
+  if (!conf) return null;
+
+  // Prefer "video" entry point (Google Meet / Zoom / etc.)
+  if (Array.isArray(conf.entryPoints)) {
+    const videoEntry = conf.entryPoints.find(
+      (ep) => ep.entryPointType === "video" && ep.uri
+    );
+    if (videoEntry) return videoEntry.uri;
+  }
+
+  return null;
+}
+//calender
+app.get("/calendar-events", async (req, res) => {
+  try {
+    const { email, calendarId } = req.query;
+
+    if (!email || !calendarId) {
+      return res
+        .status(400)
+        .json({ error: "Missing required query params: email, calendarId" });
+    }
+
+    const studentEmail = normalizeEmail(email);
+
+    // This already filters to upcoming events (timeMin = now) inside the helper
+    const events = await getEventsForStudent(calendarId, studentEmail);
+
+    const formatted = events.map((ev) => ({
+      id: ev.id,
+      summary: ev.summary || "",
+      description: ev.description || "",
+      start: ev.start,             // { dateTime, timeZone } OR { date }
+      end: ev.end,
+      htmlLink: ev.htmlLink || "", // open in Google Calendar
+      location: ev.location || "",
+      meetingLink: extractMeetingLink(ev) || "",
+      isAllDay: !!ev.start?.date && !ev.start?.dateTime,
+      isRecurring: !!(ev.recurringEventId || ev.recurrence),
+      recurringEventId: ev.recurringEventId || null,
+    }));
+
+    return res.json({ events: formatted });
+  } catch (err) {
+    console.error("/calendar-events error:", err);
+    return res
+      .status(500)
+      .json({ error: "Failed to fetch events", details: err.message });
+  }
+})
 // -----------------------------------------------------------------------------
 // Pluralcode scope enforcement (matching your Slack bot logic)
 // -----------------------------------------------------------------------------
