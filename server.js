@@ -17,8 +17,7 @@ const WebSocket = require("ws");
 const crypto = require("crypto");
 const { google } = require("googleapis");
 const textToSpeech = require("@google-cloud/text-to-speech");
-const { getEventsForStudent } = require("./googleCalendar")
-
+const { getEventsForStudent } = require("./googleCalendar");
 
 // ---- fetch polyfill (Node < 18) ----
 let fetchFn = global.fetch;
@@ -74,11 +73,14 @@ function extractMeetingLink(ev) {
 
   return null;
 }
-//calender
+
+// -----------------------------------------------------------------------------
+// Calendar Events Endpoint
+// -----------------------------------------------------------------------------
 app.get("/calendar-events", async (req, res) => {
   try {
     const { email, calendarId } = req.query;
-         if (req.headers['x-api-key'] !== process.env.MY_LMS_API_KEY) {
+    if (req.headers['x-api-key'] !== process.env.MY_LMS_API_KEY) {
       return res.status(401).json({ error: 'Unauthorized' });
     }
     if (!email || !calendarId) {
@@ -96,9 +98,9 @@ app.get("/calendar-events", async (req, res) => {
       id: ev.id,
       summary: ev.summary || "",
       description: ev.description || "",
-      start: ev.start,             // { dateTime, timeZone } OR { date }
+      start: ev.start,
       end: ev.end,
-      htmlLink: ev.htmlLink || "", // open in Google Calendar
+      htmlLink: ev.htmlLink || "",
       location: ev.location || "",
       meetingLink: extractMeetingLink(ev) || "",
       isAllDay: !!ev.start?.date && !ev.start?.dateTime,
@@ -113,7 +115,8 @@ app.get("/calendar-events", async (req, res) => {
       .status(500)
       .json({ error: "Failed to fetch events", details: err.message });
   }
-})
+});
+
 // -----------------------------------------------------------------------------
 // Pluralcode scope enforcement (matching your Slack bot logic)
 // -----------------------------------------------------------------------------
@@ -446,11 +449,15 @@ ROLE & STYLE
 - You are primarily used through VOICE, but your text answers are also shown on screen.
 
 QUIZZES
-- Only sometimes offer a quiz after you have explained a topic for a bit and the student seems ready.
-- First ask if they would LIKE a short quiz. Only generate quiz questions if the student agrees.
-- When you do provide a multiple-choice quiz, append one or more lines in this format:
-  QUIZ: {"question":"...","options":["A","B","C","D"],"correctIndex":1,"explanation":"..."}
-- The JSON must be valid, single-line, with only those fields and no markdown inside the JSON.
+- When a student asks for a quiz, test, or to be tested on a topic, you MUST generate exactly 10 multiple-choice questions.
+- Do NOT ask if they want a quiz when they explicitly request one - just generate it immediately.
+- Each question MUST be on its own line in this exact format:
+  QUIZ: {"question":"Your question here?","options":["Option A","Option B","Option C","Option D"],"correctIndex":0,"explanation":"Why this answer is correct."}
+- The JSON must be valid, single-line, with only those fields (question, options, correctIndex, explanation).
+- correctIndex is 0-based (0=first option, 1=second, etc.)
+- Generate all 10 questions in a single response, each on its own line prefixed with "QUIZ:"
+- Before the quiz questions, you may add a brief intro like "Here's your quiz on [topic]:"
+- After the quiz questions, do NOT add any closing text - the frontend handles results.
 
 LINKS & RESOURCES
 - When you recommend YouTube videos or articles, include full URLs in the TEXT so the UI can show previews.
@@ -481,7 +488,7 @@ async function callGeminiChat({ systemInstruction, contents }) {
     contents,
     generationConfig: {
       temperature: 0.4,
-      maxOutputTokens: 512,
+      maxOutputTokens: 2048,
     },
   };
 
@@ -517,7 +524,7 @@ function sanitizeForSpeech(text) {
   let t = text;
 
   // Remove QUIZ JSON so it doesn't read raw JSON
-  t = t.replace(/QUIZ:\s*{[^}]*}/gi, " ");
+  t = t.replace(/QUIZ:\s*\{[^}]*\}/gi, " ");
 
   // Cut off sections starting with "Links:" or "Resources:"
   const cutIdx = t.search(/(links:|resources:)/i);
@@ -584,7 +591,7 @@ async function synthesizeWithGoogleTTS(fullText) {
 }
 
 // -----------------------------------------------------------------------------
-// Optional HTTP /api/chat (non-WS clients)
+// HTTP /api/chat (non-WS clients)
 // -----------------------------------------------------------------------------
 app.post("/api/chat", async (req, res) => {
   try {
@@ -678,9 +685,9 @@ wss.on("connection", (ws) => {
     }
 
     if (msg.type === "ping") {
-    ws.send(JSON.stringify({ type: "pong" }));
-    return;
-  }
+      ws.send(JSON.stringify({ type: "pong" }));
+      return;
+    }
 
     // ----- START SESSION -----
     if (msg.type === "start") {
