@@ -17,8 +17,7 @@ const WebSocket = require("ws");
 const crypto = require("crypto");
 const { google } = require("googleapis");
 const textToSpeech = require("@google-cloud/text-to-speech");
-const { getEventsForStudent } = require("./googleCalendar")
-
+const { getEventsForStudent } = require("./googleCalendar");
 
 // ---- fetch polyfill (Node < 18) ----
 let fetchFn = global.fetch;
@@ -57,6 +56,9 @@ app.get("/voice", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "voice-app.html"));
 });
 
+// -----------------------------------------------------------------------------
+// Calendar helpers + endpoint
+// -----------------------------------------------------------------------------
 function extractMeetingLink(ev) {
   // Older field for Google Meet
   if (ev.hangoutLink) return ev.hangoutLink;
@@ -74,13 +76,17 @@ function extractMeetingLink(ev) {
 
   return null;
 }
-//calender
+
+// Calendar events: upcoming events for a student on a given course calendar
 app.get("/calendar-events", async (req, res) => {
   try {
     const { email, calendarId } = req.query;
-         if (req.headers['x-api-key'] !== process.env.MY_LMS_API_KEY) {
-      return res.status(401).json({ error: 'Unauthorized' });
+
+    // simple API key protection
+    if (req.headers["x-api-key"] !== process.env.MY_LMS_API_KEY) {
+      return res.status(401).json({ error: "Unauthorized" });
     }
+
     if (!email || !calendarId) {
       return res
         .status(400)
@@ -96,7 +102,7 @@ app.get("/calendar-events", async (req, res) => {
       id: ev.id,
       summary: ev.summary || "",
       description: ev.description || "",
-      start: ev.start,             // { dateTime, timeZone } OR { date }
+      start: ev.start, // { dateTime, timeZone } OR { date }
       end: ev.end,
       htmlLink: ev.htmlLink || "", // open in Google Calendar
       location: ev.location || "",
@@ -113,7 +119,8 @@ app.get("/calendar-events", async (req, res) => {
       .status(500)
       .json({ error: "Failed to fetch events", details: err.message });
   }
-})
+});
+
 // -----------------------------------------------------------------------------
 // Pluralcode scope enforcement (matching your Slack bot logic)
 // -----------------------------------------------------------------------------
@@ -281,7 +288,11 @@ async function getStudentScope(email) {
     clean
   )}`;
   try {
-    const response = await withTimeout(fetch(url), 8000, "Pluralcode API timeout");
+    const response = await withTimeout(
+      fetch(url),
+      8000,
+      "Pluralcode API timeout"
+    );
     if (!response.ok)
       throw new Error(`Pluralcode API failed with status ${response.status}`);
     const data = await response.json();
@@ -314,6 +325,21 @@ Enrolled Course(s): "${enrolledCourseNames}"
 - Only say a topic is "outside their curriculum" if it is clearly unrelated to all enrolled courses.
 - If something is ambiguous but plausibly part of their course (like Excel for Data Analytics), treat it as in-scope and answer.
 - When you recommend external resources, include full URLs in the text so the UI can show previews. In voice, do NOT spell out the URL; just refer to it naturally.`;
+}
+
+// Detect when the student's latest message is clearly asking for a quiz/test
+function isQuizRequest(text) {
+  if (!text) return false;
+  const t = text.toLowerCase();
+
+  if (t.includes("quiz")) return true;
+  if (t.includes("test me")) return true;
+  if (t.includes("practice questions")) return true;
+  if (t.includes("practice test")) return true;
+  if (t.includes("mcq")) return true;
+  if (t.includes("multiple choice") && t.includes("question")) return true;
+
+  return false;
 }
 
 // -----------------------------------------------------------------------------
@@ -446,11 +472,14 @@ ROLE & STYLE
 - You are primarily used through VOICE, but your text answers are also shown on screen.
 
 QUIZZES
-- Only sometimes offer a quiz after you have explained a topic for a bit and the student seems ready.
-- First ask if they would LIKE a short quiz. Only generate quiz questions if the student agrees.
-- When you do provide a multiple-choice quiz, append one or more lines in this format:
+- By default you may sometimes suggest a short quiz after explaining a topic.
+- If the student explicitly asks for a quiz/test/practice questions/MCQs, you MUST generate a quiz of EXACTLY 10 multiple-choice questions.
+- Every quiz question must include the correct answer so the frontend can grade it.
+- When you provide a multiple-choice quiz, use this exact JSON-line format for EACH question:
   QUIZ: {"question":"...","options":["A","B","C","D"],"correctIndex":1,"explanation":"..."}
-- The JSON must be valid, single-line, with only those fields and no markdown inside the JSON.
+- Each question must have exactly 4 options and a correctIndex from 0 to 3.
+- Make explanations short (1–2 sentences) and do not include additional JSON outside these QUIZ lines.
+- Do NOT put curly braces { or } inside the question, options, or explanation text.
 
 LINKS & RESOURCES
 - When you recommend YouTube videos or articles, include full URLs in the TEXT so the UI can show previews.
@@ -461,11 +490,28 @@ SCOPE
 - If a request is clearly unrelated to all enrolled courses, briefly say so and suggest 2–3 in-scope alternatives instead of trying to answer it.
 `;
 
+const QUIZ_MODE_INSTRUCTION = `
+[QUIZ MODE OVERRIDE]
+The student has explicitly requested a quiz or test in their most recent message.
+
+For THIS reply you must:
+- Focus the quiz on the student's current topic or enrolled courses.
+- Generate EXACTLY 10 multiple-choice questions.
+- Each question must have exactly 4 options.
+- Output each question on its own line in this exact format:
+  QUIZ: {"question":"...","options":["A","B","C","D"],"correctIndex":1,"explanation":"..."}
+- "correctIndex" must be 0, 1, 2, or 3 and must match the correct option in the "options" array.
+- Keep "question", each option, and "explanation" as short, clear English strings.
+- Do NOT include any other JSON or markdown.
+- You may include at most ONE short introductory sentence before the QUIZ lines.
+`;
+
 /**
  * Call Gemini text model with system instruction + contents array.
  * contents: [{ role: "user"|"model", parts:[{ text }] }, ...]
+ * maxTokens: optional override for maxOutputTokens
  */
-async function callGeminiChat({ systemInstruction, contents }) {
+async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
   if (!GEMINI_API_KEY) {
     throw new Error("GEMINI_API_KEY is missing.");
   }
@@ -481,7 +527,7 @@ async function callGeminiChat({ systemInstruction, contents }) {
     contents,
     generationConfig: {
       temperature: 0.4,
-      maxOutputTokens: 512,
+      maxOutputTokens: maxTokens || 512,
     },
   };
 
@@ -610,7 +656,7 @@ app.post("/api/chat", async (req, res) => {
       enrolledCourseNames,
       allowedPhrases
     );
-    const systemInstruction = `${BASE_SYSTEM_INSTRUCTION}\n\n${header}`;
+    const baseInstruction = `${BASE_SYSTEM_INSTRUCTION}\n\n${header}`;
 
     const contents = [];
 
@@ -631,9 +677,15 @@ app.post("/api/chat", async (req, res) => {
       parts: [{ text: message }],
     });
 
+    const quizMode = isQuizRequest(message);
+    const finalInstruction = quizMode
+      ? `${baseInstruction}\n\n${QUIZ_MODE_INSTRUCTION}`
+      : baseInstruction;
+
     const aiText = await callGeminiChat({
-      systemInstruction,
+      systemInstruction: finalInstruction,
       contents,
+      maxTokens: quizMode ? 2048 : 512,
     });
 
     return res.json({ text: aiText });
@@ -678,9 +730,9 @@ wss.on("connection", (ws) => {
     }
 
     if (msg.type === "ping") {
-    ws.send(JSON.stringify({ type: "pong" }));
-    return;
-  }
+      ws.send(JSON.stringify({ type: "pong" }));
+      return;
+    }
 
     // ----- START SESSION -----
     if (msg.type === "start") {
@@ -760,10 +812,16 @@ wss.on("connection", (ws) => {
         parts: [{ text: h.text }],
       }));
 
+      const quizMode = isQuizRequest(text);
+      const finalInstruction = quizMode
+        ? `${ws.session.systemInstruction}\n\n${QUIZ_MODE_INSTRUCTION}`
+        : ws.session.systemInstruction;
+
       try {
         const aiText = await callGeminiChat({
-          systemInstruction: ws.session.systemInstruction,
+          systemInstruction: finalInstruction,
           contents,
+          maxTokens: quizMode ? 2048 : 512,
         });
 
         ws.session.history.push({ role: "assistant", text: aiText });
