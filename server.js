@@ -560,48 +560,53 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
 function sanitizeForSpeech(text) {
   if (!text) return "";
 
-  let t = text;
+  // 1) Remove any full lines that start with QUIZ:
+  let t = text
+    .split(/\r?\n/)
+    .filter((line) => !line.trim().toUpperCase().startsWith("QUIZ:"))
+    .join(" ");
 
-  // Remove QUIZ JSON so it doesn't read raw JSON
+  // 2) Extra safety: strip any inline QUIZ: {...} that might remain
   t = t.replace(/QUIZ:\s*{[^}]*}/gi, " ");
 
-  // Cut off sections starting with "Links:" or "Resources:"
+  // 3) Cut off sections starting with "Links:" or "Resources:"
   const cutIdx = t.search(/(links:|resources:)/i);
   if (cutIdx !== -1) {
     t = t.slice(0, cutIdx);
   }
 
-  // Remove explicit URLs (http/https)
+  // 4) Remove explicit URLs (http/https)
   t = t.replace(/https?:\/\/\S+/gi, " ");
 
-  // Remove bare domains like example.com/path
+  // 5) Remove bare domains like example.com/path
   t = t.replace(
     /\b[^\s]+\.(com|net|org|io|ai|edu|co|dev|info)(\/[^\s]*)?/gi,
     " "
   );
 
-  // Remove "www." style hosts
+  // 6) Remove "www." style hosts
   t = t.replace(/\bwww\.[^\s]+/gi, " ");
 
-  // Remove inline code and markdown-ish symbols
+  // 7) Remove inline code and markdown-ish symbols
   t = t.replace(/`[^`]*`/g, " ");
   t = t.replace(/[*_>#\-]+/g, " ");
   t = t.replace(/[•~_=^]+/g, " ");
 
-  // Remove brackets, slashes, pipes
+  // 8) Remove brackets, slashes, pipes
   t = t.replace(/[\[\]\(\)\{\}<>\/\\|]+/g, " ");
 
-  // Collapse extra punctuation
+  // 9) Collapse extra punctuation
   t = t.replace(/[;:]{2,}/g, " ");
 
-  // Fix some pronunciations
+  // 10) Fix some pronunciations
   t = t.replace(/\bExcel\b/gi, "Microsoft Excel");
 
-  // Collapse extra whitespace
+  // 11) Collapse extra whitespace
   t = t.replace(/\s{2,}/g, " ");
 
   return t.trim();
 }
+
 
 async function synthesizeWithGoogleTTS(fullText) {
   const spoken = sanitizeForSpeech(fullText);

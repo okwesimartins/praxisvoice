@@ -141,28 +141,39 @@ function extractQuizzesFromText(text) {
   const quizzes = [];
   if (!text) return { cleanText: text, quizzes };
 
-  let cleanText = text;
-  const regex = /QUIZ:\s*({[^}]*})/gi;
-  let match;
+  const lines = text.split(/\r?\n/);
+  const keptLines = [];
 
-  while ((match = regex.exec(text)) !== null) {
-    const jsonStr = match[1];
-    try {
-      const quiz = JSON.parse(jsonStr);
-      if (
-        quiz &&
-        typeof quiz.question === "string" &&
-        Array.isArray(quiz.options) &&
-        typeof quiz.correctIndex === "number"
-      ) {
-        quizzes.push(quiz);
+  for (const line of lines) {
+    const trimmed = line.trim();
+
+    // We treat any line that STARTS with "QUIZ:" as a quiz line
+    if (trimmed.toUpperCase().startsWith("QUIZ:")) {
+      const jsonPart = trimmed.slice(5).trim(); // remove "QUIZ:"
+
+      try {
+        const quiz = JSON.parse(jsonPart);
+        if (
+          quiz &&
+          typeof quiz.question === "string" &&
+          Array.isArray(quiz.options) &&
+          quiz.options.length === 4 &&
+          typeof quiz.correctIndex === "number"
+        ) {
+          quizzes.push(quiz);
+          continue; // don't keep this line in the transcript
+        }
+      } catch (e) {
+        console.warn("Failed to parse QUIZ JSON line:", trimmed, e);
+        // fall through and keep the line as normal text if parsing fails
       }
-    } catch (e) {
-      console.warn("Failed to parse QUIZ JSON:", e);
     }
+
+    // Not a valid QUIZ line → keep it as part of the transcript
+    keptLines.push(line);
   }
 
-  cleanText = cleanText.replace(/QUIZ:\s*{[^}]*}/gi, "").trim();
+  const cleanText = keptLines.join("\n").trim();
   return { cleanText, quizzes };
 }
 
