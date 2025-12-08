@@ -483,7 +483,17 @@ QUIZZES
 
 LINKS & RESOURCES
 - When you recommend YouTube videos or articles, include full URLs in the TEXT so the UI can show previews.
-- In voice, do NOT read out the full URL; just say something like: "I'm sharing a YouTube link in your resources panel."
+- Whenever you share specific resources, also append one JSON line per resource at the END of your reply in one of these formats:
+  VIDEO: {"title":"...","url":"https://...","description":"...","platform":"youtube"}
+  ARTICLE: {"title":"...","url":"https://...","description":"...","source":"article"}
+- For these JSON objects:
+  - "title" is a short human-readable title.
+  - "url" is the full link to the video or article.
+  - "description" is a short 1–2 sentence description.
+  - "platform"/"source" are short identifiers like "youtube", "docs", "blog".
+- Do NOT put curly braces { or } inside any of the string fields in these JSON objects.
+- If the student explicitly asks for videos or articles, you MUST include at least 3 structured VIDEO or ARTICLE lines (if such resources exist).
+- In voice, do NOT read out the full URL; just say something like: "I'm sharing a link in your resources panel."
 
 SCOPE
 - You must also follow an extra [CONTEXT] block that describes the student's enrolled courses and allowed topics.
@@ -560,14 +570,22 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
 function sanitizeForSpeech(text) {
   if (!text) return "";
 
-  // 1) Remove any full lines that start with QUIZ:
+  // 1) Remove any full lines that start with QUIZ:, VIDEO:, or ARTICLE:
   let t = text
     .split(/\r?\n/)
-    .filter((line) => !line.trim().toUpperCase().startsWith("QUIZ:"))
+    .filter((line) => {
+      const upper = line.trim().toUpperCase();
+      if (upper.startsWith("QUIZ:")) return false;
+      if (upper.startsWith("VIDEO:")) return false;
+      if (upper.startsWith("ARTICLE:")) return false;
+      return true;
+    })
     .join(" ");
 
-  // 2) Extra safety: strip any inline QUIZ: {...} that might remain
+  // 2) Extra safety: strip any inline QUIZ: {...}, VIDEO: {...}, ARTICLE: {...}
   t = t.replace(/QUIZ:\s*{[^}]*}/gi, " ");
+  t = t.replace(/VIDEO:\s*{[^}]*}/gi, " ");
+  t = t.replace(/ARTICLE:\s*{[^}]*}/gi, " ");
 
   // 3) Cut off sections starting with "Links:" or "Resources:"
   const cutIdx = t.search(/(links:|resources:)/i);
@@ -607,7 +625,6 @@ function sanitizeForSpeech(text) {
   return t.trim();
 }
 
-
 async function synthesizeWithGoogleTTS(fullText) {
   const spoken = sanitizeForSpeech(fullText);
   if (!spoken) return null;
@@ -615,9 +632,10 @@ async function synthesizeWithGoogleTTS(fullText) {
   const request = {
     input: { text: spoken },
     voice: {
-      languageCode: "en-US",
-      name: "en-US-Neural2-J", // male, natural neural voice
+      // Use British English as closest to Nigerian accent in Google TTS right now
+      languageCode: "en-GB",
       ssmlGender: "MALE",
+      // No "name" field, let Google pick default en-GB male
     },
     audioConfig: {
       audioEncoding: "MP3",

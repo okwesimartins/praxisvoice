@@ -1,6 +1,6 @@
 // ================= CONFIG =================
 
-const WS_URL ="wss://veritas-ai-voice-156084498565.europe-west1.run.app/ws";
+const WS_URL = "wss://veritas-ai-voice-156084498565.europe-west1.run.app/ws";
 
 // ================= DOM ELEMENTS =================
 
@@ -21,7 +21,7 @@ const quizScoreEl = document.getElementById("quizScore");
 
 let ws = null;
 let wsReady = false;
-let heartbeatInterval = null;   // client heartbeat
+let heartbeatInterval = null; // client heartbeat
 
 let recognition = null;
 let sttActive = false;
@@ -81,7 +81,7 @@ function addTranscriptLine(role, text) {
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
 }
 
-// ================= YOUTUBE PREVIEW =================
+// ================= YOUTUBE PREVIEW (fallback for plain URLs) =================
 
 function extractYoutubeLinks(text) {
   const links = [];
@@ -269,6 +269,109 @@ function renderQuiz(quiz) {
   updateQuizScoreDisplay();
 }
 
+// ================= RESOURCES (STRUCTURED VIDEOS / ARTICLES) =================
+
+function extractResourcesFromText(text) {
+  const videos = [];
+  const articles = [];
+  if (!text) return { cleanText: text, videos, articles };
+
+  const lines = text.split(/\r?\n/);
+  const keptLines = [];
+
+  for (const line of lines) {
+    const trimmed = line.trim();
+    const upper = trimmed.toUpperCase();
+
+    if (upper.startsWith("VIDEO:")) {
+      const jsonPart = trimmed.slice(6).trim(); // remove "VIDEO:"
+      try {
+        const video = JSON.parse(jsonPart);
+        if (video && typeof video.url === "string") {
+          videos.push(video);
+          continue; // don't keep this line
+        }
+      } catch (e) {
+        console.warn("Failed to parse VIDEO JSON line:", trimmed, e);
+      }
+    }
+
+    if (upper.startsWith("ARTICLE:")) {
+      const jsonPart = trimmed.slice(8).trim(); // remove "ARTICLE:"
+      try {
+        const article = JSON.parse(jsonPart);
+        if (article && typeof article.url === "string") {
+          articles.push(article);
+          continue; // don't keep this line
+        }
+      } catch (e) {
+        console.warn("Failed to parse ARTICLE JSON line:", trimmed, e);
+      }
+    }
+
+    // Not structured resource line → keep
+    keptLines.push(line);
+  }
+
+  const cleanText = keptLines.join("\n").trim();
+  return { cleanText, videos, articles };
+}
+
+function renderVideoResource(video) {
+  if (!resourcesEl) return;
+  const ph = resourcesEl.querySelector(".placeholder");
+  if (ph) ph.remove();
+
+  const url = video.url;
+  const title = video.title || "Video resource";
+  const description = video.description || "";
+  const videoId = getYouTubeIdFromUrl(url);
+
+  const card = document.createElement("div");
+  card.className = "resource-card video-resource";
+
+  if (videoId) {
+    card.innerHTML = `
+      <a href="${url}" target="_blank" rel="noopener noreferrer" class="yt-thumb-link">
+        <img src="https://img.youtube.com/vi/${videoId}/hqdefault.jpg" class="yt-thumb" alt="YouTube thumbnail" />
+        <div class="yt-meta">
+          <div class="yt-title">${title}</div>
+          <div class="yt-desc">${description}</div>
+        </div>
+      </a>
+    `;
+  } else {
+    card.innerHTML = `
+      <a href="${url}" target="_blank" rel="noopener noreferrer" class="resource-link">
+        <div class="resource-title">${title}</div>
+        <div class="resource-desc">${description}</div>
+      </a>
+    `;
+  }
+
+  resourcesEl.appendChild(card);
+}
+
+function renderArticleResource(article) {
+  if (!resourcesEl) return;
+  const ph = resourcesEl.querySelector(".placeholder");
+  if (ph) ph.remove();
+
+  const url = article.url;
+  const title = article.title || "Article";
+  const description = article.description || article.summary || "";
+
+  const card = document.createElement("div");
+  card.className = "resource-card article-resource";
+  card.innerHTML = `
+    <a href="${url}" target="_blank" rel="noopener noreferrer" class="resource-link">
+      <div class="resource-title">${title}</div>
+      <div class="resource-desc">${description}</div>
+    </a>
+  `;
+  resourcesEl.appendChild(card);
+}
+
 // ================= AUDIO: Web Audio API (iOS-friendly TTS) =================
 
 function ensureAudioContext() {
@@ -373,7 +476,7 @@ function resetSilenceTimer() {
         console.error("recognition.stop() in silenceTimer failed:", e);
       }
     }
-  }, 2500); // ~2.5s of silence after you've spoken
+  }, 1000); // ~1.0s of silence after you've spoken
 }
 
 function initSTT() {
@@ -625,18 +728,33 @@ function openWebSocket() {
     if (msg.type === "assistant_text") {
       const aiText = msg.text || "";
       log("Praxis replied.");
-      const { cleanText, quizzes } = extractQuizzesFromText(aiText);
 
-      if (cleanText) {
-        addTranscriptLine("assistant", cleanText);
-        conversationHistory.push({ role: "assistant", text: cleanText });
+      // 1) Strip QUIZ lines
+      const { cleanText: noQuizText, quizzes } = extractQuizzesFromText(aiText);
 
-        const ytLinks = extractYoutubeLinks(cleanText);
+      // 2) Strip structured VIDEO / ARTICLE lines
+      const {
+        cleanText: finalText,
+        videos,
+        articles,
+      } = extractResourcesFromText(noQuizText);
+
+      // 3) Show the remaining natural language in transcript
+      if (finalText) {
+        addTranscriptLine("assistant", finalText);
+        conversationHistory.push({ role: "assistant", text: finalText });
+
+        // still auto-detect bare YouTube links in the remaining text
+        const ytLinks = extractYoutubeLinks(finalText);
         ytLinks.forEach(renderYoutubePreview);
       }
 
+      // 4) Render quizzes & structured resources
       quizzes.forEach(renderQuiz);
+      videos.forEach(renderVideoResource);
+      articles.forEach(renderArticleResource);
 
+      // 5) Play TTS audio if present
       if (msg.audio) {
         playAssistantAudio(msg.audio, msg.audioMime);
       }
