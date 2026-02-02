@@ -462,7 +462,8 @@ if (!GEMINI_API_KEY) {
 }
 
 // FIX: Normalize model name properly
-const RAW_MODEL = process.env.GEMINI_MODEL || "gemini-1.5-flash"; // Use stable version as default
+// Common Gemini models: gemini-pro, gemini-1.5-pro, gemini-1.5-flash, gemini-2.0-flash-exp
+const RAW_MODEL = process.env.GEMINI_MODEL || "gemini-pro"; // Use most stable version as default
 let GEMINI_MODEL = RAW_MODEL;
 
 // Ensure model name has "models/" prefix for the API
@@ -555,9 +556,6 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
     };
   });
 
-  // Try v1beta first (for experimental models like gemini-2.0-flash-exp)
-  let url = `https://generativelanguage.googleapis.com/v1beta/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-
   const body = {
     contents: formattedContents,
     generationConfig: {
@@ -565,6 +563,9 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
       maxOutputTokens: maxTokens || 512,
     },
   };
+
+  // Try v1 first (most stable, works with gemini-pro, gemini-1.5-pro, etc.)
+  let url = `https://generativelanguage.googleapis.com/v1/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
 
   try {
     const res = await fetch(url, {
@@ -588,50 +589,76 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
         status: res.status,
         statusText: res.statusText,
         model: GEMINI_MODEL,
-        endpoint: "v1beta",
+        endpoint: "v1",
         error: errData,
         url: url.replace(GEMINI_API_KEY, "REDACTED")
       });
 
-      // If 404, try v1 endpoint (stable API)
+      // If 404, try alternative models or v1beta
       if (res.status === 404) {
-        console.log(`⚠️ v1beta endpoint returned 404. Trying v1 endpoint...`);
-        const v1Url = `https://generativelanguage.googleapis.com/v1/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+        console.log(`⚠️ Model ${GEMINI_MODEL} not found. Trying fallback models...`);
+        
+        // Try common fallback models
+        const fallbackModels = [
+          "models/gemini-pro",           // Most stable
+          "models/gemini-1.5-pro",       // Latest stable
+          "models/gemini-1.5-flash",     // Fast version
+          "models/gemini-2.0-flash-exp"  // Experimental
+        ];
 
-        const v1Res = await fetch(v1Url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify(body),
-        });
+        // Remove current model from fallbacks if it's already there
+        const modelsToTry = fallbackModels.filter(m => m !== GEMINI_MODEL);
 
-        if (!v1Res.ok) {
-          const v1ErrText = await v1Res.text();
-          let v1ErrData;
-          try {
-            v1ErrData = JSON.parse(v1ErrText);
-          } catch (_) {
-            v1ErrData = { raw: v1ErrText };
-          }
-
-          console.error("Gemini API v1 also failed:", {
-            status: v1Res.status,
-            statusText: v1Res.statusText,
-            model: GEMINI_MODEL,
-            error: v1ErrData
+        for (const fallbackModel of modelsToTry) {
+          console.log(`Trying fallback model: ${fallbackModel}`);
+          
+          // Try v1 first
+          const fallbackUrl = `https://generativelanguage.googleapis.com/v1/${fallbackModel}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+          
+          const fallbackRes = await fetch(fallbackUrl, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(body),
           });
 
-          throw new Error(
-            `Gemini API error (both v1beta and v1 failed): ${v1Res.status} - ${JSON.stringify(v1ErrData)}`
-          );
+          if (fallbackRes.ok) {
+            console.log(`✅ Success with model: ${fallbackModel}`);
+            const fallbackData = await fallbackRes.json();
+            const parts =
+              fallbackData.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean) ||
+              [];
+            return parts.join(" ").trim() || "(no response text)";
+          }
+
+          // If v1 fails, try v1beta for experimental models
+          if (fallbackModel.includes("exp") || fallbackModel.includes("flash")) {
+            const v1betaUrl = `https://generativelanguage.googleapis.com/v1beta/${fallbackModel}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+            
+            const v1betaRes = await fetch(v1betaUrl, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify(body),
+            });
+
+            if (v1betaRes.ok) {
+              console.log(`✅ Success with model (v1beta): ${fallbackModel}`);
+              const v1betaData = await v1betaRes.json();
+              const parts =
+                v1betaData.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean) ||
+                [];
+              return parts.join(" ").trim() || "(no response text)";
+            }
+          }
         }
 
-        const v1Data = await v1Res.json();
-        const parts =
-          v1Data.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean) ||
-          [];
-        return parts.join(" ").trim() || "(no response text)";
+        // All models failed
+        throw new Error(
+          `Gemini API error: Model ${GEMINI_MODEL} not found. Tried fallbacks: ${modelsToTry.join(", ")}. Please set GEMINI_MODEL to a valid model name (e.g., gemini-pro, gemini-1.5-pro).`
+        );
       }
 
       throw new Error(
