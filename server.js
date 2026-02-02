@@ -527,7 +527,7 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
     throw new Error("GEMINI_API_KEY is missing.");
   }
 
-  const url = `https://generativelanguage.googleapis.com/v1beta/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(
+  const url = `https://generativelanguage.googleapis.com/v1/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(
     GEMINI_API_KEY
   )}`;
 
