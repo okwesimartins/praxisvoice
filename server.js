@@ -461,7 +461,7 @@ if (!GEMINI_API_KEY) {
 const RAW_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
 // Ensure we only have the bare model id here (no "models/" prefix).
-const MODEL_ID = RAW_MODEL.replace(/^models\//, "");
+const GEMINI_MODEL = RAW_MODEL.replace(/^models\//, "");
 
 
 const BASE_SYSTEM_INSTRUCTION = `
