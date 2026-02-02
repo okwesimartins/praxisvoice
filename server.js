@@ -458,7 +458,7 @@ if (!GEMINI_API_KEY) {
   console.warn("⚠️ GEMINI_API_KEY not set in environment!");
 }
 
-const RAW_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const RAW_MODEL = process.env.GEMINI_MODEL || "gemini-1.5-flash";
 
 // Ensure we only have the bare model id here (no "models/" prefix).
 const GEMINI_MODEL = RAW_MODEL.replace(/^models\//, "");
@@ -537,9 +537,9 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
       parts: [{ text: systemInstruction }],
     },
     contents,
-    generation_config: {
+    generationConfig: {
       temperature: 0.4,
-      max_output_tokens: maxTokens || 512,
+      maxOutputTokens: maxTokens || 512,
     },
   };
 
