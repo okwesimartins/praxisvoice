@@ -532,13 +532,14 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
   )}`;
 
   const body = {
-    systemInstruction: {
+    // ✅ v1 REQUIRES snake_case
+    system_instruction: {
       parts: [{ text: systemInstruction }],
     },
     contents,
-    generationConfig: {
+    generation_config: {
       temperature: 0.4,
-      maxOutputTokens: maxTokens || 512,
+      max_output_tokens: maxTokens || 512,
     },
   };
 
@@ -557,12 +558,15 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
   }
 
   const data = await res.json();
+
   const parts =
-    data.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean) ||
-    [];
-  const text = parts.join(" ").trim() || "(no response text)";
-  return text;
+    data.candidates?.[0]?.content?.parts
+      ?.map((p) => p.text)
+      .filter(Boolean) || [];
+
+  return parts.join(" ").trim() || "(no response text)";
 }
+
 
 // -----------------------------------------------------------------------------
 // GOOGLE TTS — sanitize + synthesize (no URLs or weird characters)
