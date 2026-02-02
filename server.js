@@ -1,8 +1,11 @@
 /**
- * server.js — Praxis Voice Backend (Gemini text + Google TTS + WebSocket)
- * - Express health + serves static frontend (public/voice-app.html)
- * - WS /ws: browser text <-> Gemini text API + Google Text-to-Speech
- * - Enforces LMS key + student course scope (aligned with Slack index.js)
+ * FIXED server.js — Praxis Voice Backend (Gemini text + Google TTS + WebSocket)
+ * 
+ * FIXES APPLIED:
+ * 1. Fixed Gemini API endpoint - added fallback to v1 if v1beta fails
+ * 2. Fixed model name handling - properly handles with/without "models/" prefix
+ * 3. Added better error logging to identify the exact issue
+ * 4. Added test endpoint to verify API key and model
  */
 
 if (process.env.NODE_ENV !== "production") {
@@ -451,18 +454,23 @@ async function search_web_for_articles({ query }) {
 }
 
 // -----------------------------------------------------------------------------
-// Gemini text API
+// Gemini text API - FIXED VERSION
 // -----------------------------------------------------------------------------
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 if (!GEMINI_API_KEY) {
   console.warn("⚠️ GEMINI_API_KEY not set in environment!");
 }
 
-const RAW_MODEL = process.env.GEMINI_MODEL || "gemini-1.5-flash";
+// FIX: Normalize model name properly
+const RAW_MODEL = process.env.GEMINI_MODEL || "gemini-1.5-flash"; // Use stable version as default
+let GEMINI_MODEL = RAW_MODEL;
 
-// Ensure we only have the bare model id here (no "models/" prefix).
-const GEMINI_MODEL = RAW_MODEL.replace(/^models\//, "");
+// Ensure model name has "models/" prefix for the API
+if (!GEMINI_MODEL.startsWith("models/")) {
+  GEMINI_MODEL = `models/${GEMINI_MODEL}`;
+}
 
+console.log(`📌 Using Gemini model: ${GEMINI_MODEL}`);
 
 const BASE_SYSTEM_INSTRUCTION = `
 You are Praxis, a specialized MALE AI tutor for Pluralcode Academy students.
@@ -518,7 +526,7 @@ For THIS reply you must:
 `;
 
 /**
- * Call Gemini text model with system instruction + contents array.
+ * FIXED: Call Gemini text model with proper error handling and fallback
  * contents: [{ role: "user"|"model", parts:[{ text }] }, ...]
  * maxTokens: optional override for maxOutputTokens
  */
@@ -527,13 +535,14 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
     throw new Error("GEMINI_API_KEY is missing.");
   }
 
-  const url = `https://generativelanguage.googleapis.com/v1/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(
-    GEMINI_API_KEY
-  )}`;
+  // Extract model name without "models/" prefix for URL construction
+  const modelName = GEMINI_MODEL.replace("models/", "");
+
+  // Try v1beta first (for experimental models like gemini-2.0-flash-exp)
+  let url = `https://generativelanguage.googleapis.com/v1beta/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
 
   const body = {
-    // ✅ v1 REQUIRES snake_case
-    system_instruction: {
+    systemInstruction: {
       parts: [{ text: systemInstruction }],
     },
     contents,
@@ -543,30 +552,159 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
     },
   };
 
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-  });
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
 
-  if (!res.ok) {
-    const errText = await res.text();
-    console.error("Gemini error response:", errText);
-    throw new Error(`Gemini API error: ${res.status}`);
+    if (!res.ok) {
+      const errText = await res.text();
+      let errData;
+      try {
+        errData = JSON.parse(errText);
+      } catch (_) {
+        errData = { raw: errText };
+      }
+
+      console.error("Gemini API error response:", {
+        status: res.status,
+        statusText: res.statusText,
+        model: GEMINI_MODEL,
+        endpoint: "v1beta",
+        error: errData,
+        url: url.replace(GEMINI_API_KEY, "REDACTED")
+      });
+
+      // If 404, try v1 endpoint (stable API)
+      if (res.status === 404) {
+        console.log(`⚠️ v1beta endpoint returned 404. Trying v1 endpoint...`);
+        const v1Url = `https://generativelanguage.googleapis.com/v1/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+
+        const v1Res = await fetch(v1Url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(body),
+        });
+
+        if (!v1Res.ok) {
+          const v1ErrText = await v1Res.text();
+          let v1ErrData;
+          try {
+            v1ErrData = JSON.parse(v1ErrText);
+          } catch (_) {
+            v1ErrData = { raw: v1ErrText };
+          }
+
+          console.error("Gemini API v1 also failed:", {
+            status: v1Res.status,
+            statusText: v1Res.statusText,
+            model: GEMINI_MODEL,
+            error: v1ErrData
+          });
+
+          throw new Error(
+            `Gemini API error (both v1beta and v1 failed): ${v1Res.status} - ${JSON.stringify(v1ErrData)}`
+          );
+        }
+
+        const v1Data = await v1Res.json();
+        const parts =
+          v1Data.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean) ||
+          [];
+        return parts.join(" ").trim() || "(no response text)";
+      }
+
+      throw new Error(
+        `Gemini API error: ${res.status} - ${JSON.stringify(errData)}`
+      );
+    }
+
+    const data = await res.json();
+    const parts =
+      data.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean) ||
+      [];
+    return parts.join(" ").trim() || "(no response text)";
+  } catch (error) {
+    console.error("Gemini API call failed:", error);
+    throw error;
   }
-
-  const data = await res.json();
-
-  const parts =
-    data.candidates?.[0]?.content?.parts
-      ?.map((p) => p.text)
-      .filter(Boolean) || [];
-
-  return parts.join(" ").trim() || "(no response text)";
 }
 
+// -----------------------------------------------------------------------------
+// TEST ENDPOINT - Add this to verify your API key and model
+// -----------------------------------------------------------------------------
+app.get("/test-gemini", async (req, res) => {
+  try {
+    if (!GEMINI_API_KEY) {
+      return res.status(500).json({ error: "GEMINI_API_KEY not set" });
+    }
+
+    const modelName = GEMINI_MODEL.replace("models/", "");
+    
+    // Test v1beta
+    const v1betaUrl = `https://generativelanguage.googleapis.com/v1beta/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+    
+    const testBody = {
+      contents: [{
+        parts: [{ text: "Say hello in one word" }]
+      }]
+    };
+
+    console.log(`Testing Gemini API with model: ${GEMINI_MODEL}`);
+
+    const v1betaRes = await fetch(v1betaUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(testBody)
+    });
+
+    const v1betaData = await v1betaRes.json();
+
+    if (v1betaRes.ok) {
+      return res.json({
+        success: true,
+        endpoint: "v1beta",
+        model: GEMINI_MODEL,
+        response: v1betaData.candidates?.[0]?.content?.parts?.[0]?.text || "No text in response"
+      });
+    }
+
+    // If v1beta fails, try v1
+    const v1Url = `https://generativelanguage.googleapis.com/v1/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
+    
+    const v1Res = await fetch(v1Url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(testBody)
+    });
+
+    const v1Data = await v1Res.json();
+
+    res.json({
+      success: v1Res.ok,
+      v1beta: {
+        status: v1betaRes.status,
+        error: v1betaData
+      },
+      v1: {
+        status: v1Res.status,
+        response: v1Res.ok ? (v1Data.candidates?.[0]?.content?.parts?.[0]?.text || "No text") : v1Data
+      },
+      model: GEMINI_MODEL
+    });
+  } catch (error) {
+    res.status(500).json({ 
+      error: error.message,
+      stack: error.stack 
+    });
+  }
+});
 
 // -----------------------------------------------------------------------------
 // GOOGLE TTS — sanitize + synthesize (no URLs or weird characters)
@@ -846,12 +984,16 @@ wss.on("connection", (ws) => {
         : ws.session.systemInstruction;
 
       try {
+        // Log WebSocket request for debugging
+        console.log(`[WS ${ws.id}] Calling Gemini API for user: ${ws.session.studentEmail}`);
+        
         const aiText = await callGeminiChat({
           systemInstruction: finalInstruction,
           contents,
           maxTokens: quizMode ? 2048 : 512,
         });
 
+        console.log(`[WS ${ws.id}] Gemini API success, response length: ${aiText.length}`);
         ws.session.history.push({ role: "assistant", text: aiText });
 
         let tts = null;
@@ -873,11 +1015,17 @@ wss.on("connection", (ws) => {
 
         ws.send(JSON.stringify(payload));
       } catch (err) {
-        console.error("WS chat error:", err);
+        console.error(`[WS ${ws.id}] Gemini API error:`, {
+          error: err.message,
+          stack: err.stack,
+          model: GEMINI_MODEL,
+          studentEmail: ws.session?.studentEmail
+        });
         ws.send(
           JSON.stringify({
             type: "error",
             error: err.message || "Gemini error",
+            details: process.env.NODE_ENV === "development" ? err.stack : undefined
           })
         );
       }
@@ -911,3 +1059,4 @@ server.listen(PORT, "0.0.0.0", () =>
     `🚀 Praxis Voice (Gemini+TTS+WS) listening on ${PORT}, model=${GEMINI_MODEL}`
   )
 );
+
