@@ -458,10 +458,11 @@ if (!GEMINI_API_KEY) {
   console.warn("⚠️ GEMINI_API_KEY not set in environment!");
 }
 
-const RAW_MODEL = process.env.GEMINI_MODEL || "models/gemini-2.0-flash-exp";
-const GEMINI_MODEL = RAW_MODEL.startsWith("models/")
-  ? RAW_MODEL
-  : `models/${RAW_MODEL}`;
+const RAW_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+
+// Ensure we only have the bare model id here (no "models/" prefix).
+const MODEL_ID = RAW_MODEL.replace(/^models\//, "");
+
 
 const BASE_SYSTEM_INSTRUCTION = `
 You are Praxis, a specialized MALE AI tutor for Pluralcode Academy students.
