@@ -538,14 +538,28 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
   // Extract model name without "models/" prefix for URL construction
   const modelName = GEMINI_MODEL.replace("models/", "");
 
+  // FIX: systemInstruction field is not recognized by Gemini API
+  // Solution: Prepend system instruction to the first user message in contents
+  const formattedContents = contents.map((c, idx) => {
+    const role = c.role === "model" ? "model" : "user";
+    let text = c.parts[0]?.text || "";
+    
+    // Prepend system instruction to the first user message
+    if (idx === 0 && role === "user" && systemInstruction) {
+      text = `${systemInstruction}\n\n${text}`;
+    }
+    
+    return {
+      role,
+      parts: [{ text }]
+    };
+  });
+
   // Try v1beta first (for experimental models like gemini-2.0-flash-exp)
   let url = `https://generativelanguage.googleapis.com/v1beta/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
 
   const body = {
-    systemInstruction: {
-      parts: [{ text: systemInstruction }],
-    },
-    contents,
+    contents: formattedContents,
     generationConfig: {
       temperature: 0.4,
       maxOutputTokens: maxTokens || 512,
