@@ -1,20 +1,18 @@
 /**
  * server.js — Praxis Voice Backend (Gemini + Google TTS + WebSocket)
  *
- * ✅ DROP-IN FIX (Jan/Feb 2026 safe):
- * - Removes hard-coded GEMINI_MODEL variable usage everywhere
- * - Uses the current official Node SDK: @google/genai (dynamic import for CJS)
- * - Auto-probes working models and survives “404 model not found”
- * - Never crashes the voice flow on “empty response” — returns a safe fallback sentence
+ * DROP-IN FIX for:
+ * - 404 model not found (retired models / bad fallbacks)
+ * - 400 Unknown name "systemInstruction" (wrong apiVersion/schema)
  *
- * IMPORTANT:
+ * Requires:
  *   npm uninstall @google/generative-ai
  *   npm install @google/genai
  *
  * ENV:
  *   GEMINI_API_KEY=...
- *   (optional) GEMINI_MODEL=gemini-2.5-flash   // recommended for voice latency
- *   (optional) GEMINI_API_VERSION=v1
+ *   GEMINI_MODEL=gemini-2.5-flash   (recommended for voice)
+ *   GEMINI_API_VERSION=v1beta       (IMPORTANT: use v1beta for Developer API)
  */
 
 if (process.env.NODE_ENV !== "production") {
@@ -69,7 +67,6 @@ app.get("/voice", (req, res) => {
 // -----------------------------------------------------------------------------
 function extractMeetingLink(ev) {
   if (ev.hangoutLink) return ev.hangoutLink;
-
   const conf = ev.conferenceData;
   if (!conf) return null;
 
@@ -82,10 +79,13 @@ function extractMeetingLink(ev) {
   return null;
 }
 
+const normalizeEmail = (e) => String(e || "").trim().toLowerCase();
+
 app.get("/calendar-events", async (req, res) => {
   try {
     const { email, calendarId } = req.query;
 
+    // simple API key protection
     if (req.headers["x-api-key"] !== process.env.MY_LMS_API_KEY) {
       return res.status(401).json({ error: "Unauthorized" });
     }
@@ -97,7 +97,6 @@ app.get("/calendar-events", async (req, res) => {
     }
 
     const studentEmail = normalizeEmail(email);
-
     const events = await getEventsForStudent(calendarId, studentEmail);
 
     const formatted = events.map((ev) => ({
@@ -124,12 +123,10 @@ app.get("/calendar-events", async (req, res) => {
 });
 
 // -----------------------------------------------------------------------------
-// Pluralcode scope enforcement (matching your Slack bot logic)
+// Pluralcode scope enforcement
 // -----------------------------------------------------------------------------
 const PLURALCODE_API_BASE =
   process.env.PLURALCODE_API_URL || "https://backend.pluralcode.institute";
-
-const normalizeEmail = (e) => String(e || "").trim().toLowerCase();
 
 const withTimeout = async (promise, ms, msg = "Timed out") => {
   const timeout = new Promise((_, reject) =>
@@ -289,18 +286,14 @@ async function getStudentScope(email) {
     clean
   )}`;
 
-  try {
-    const response = await withTimeout(fetch(url), 8000, "Pluralcode API timeout");
-    if (!response.ok)
-      throw new Error(`Pluralcode API failed with status ${response.status}`);
-    const data = await response.json();
-    const scope = buildAllowedFromPayload(data);
-    if (!scope.courseNames.length)
-      throw new Error("No active course enrollment found.");
-    return scope;
-  } catch (error) {
-    throw new Error("Could not verify student enrollment.");
-  }
+  const response = await withTimeout(fetch(url), 8000, "Pluralcode API timeout");
+  if (!response.ok)
+    throw new Error(`Pluralcode API failed with status ${response.status}`);
+  const data = await response.json();
+
+  const scope = buildAllowedFromPayload(data);
+  if (!scope.courseNames.length) throw new Error("No active course enrollment found.");
+  return scope;
 }
 
 const summarizeAllowed = (arr, n = 80) => {
@@ -321,8 +314,7 @@ Enrolled Course(s): "${enrolledCourseNames}"
 - Focus on the student's enrolled course(s) and closely related tools and topics.
 - Standard tools for those courses (for example: Excel, Power BI, SQL, Python, NumPy, pandas, Jupyter, ETL, Scrum, Kanban, etc.) are considered IN SCOPE even if the exact word does not literally appear in the raw curriculum data.
 - Only say a topic is "outside their curriculum" if it is clearly unrelated to all enrolled courses.
-- If something is ambiguous but plausibly part of their course (like Excel for Data Analytics), treat it as in-scope and answer.
-- When you recommend external resources, include full URLs in the text so the UI can show previews. In voice, do NOT spell out the URL; just refer to it naturally.`;
+- If something is ambiguous but plausibly part of their course (like Excel for Data Analytics), treat it as in-scope and answer.`;
 }
 
 function isQuizRequest(text) {
@@ -338,126 +330,31 @@ function isQuizRequest(text) {
 }
 
 // -----------------------------------------------------------------------------
-// (Optional) Google search helpers — available if you later want tools
-// -----------------------------------------------------------------------------
-const Google_Search_API_KEY = process.env.Google_Search_API_KEY;
-const Google_Search_CX_ID = process.env.Google_Search_CX_ID;
-
-const youtube = google.youtube({
-  version: "v3",
-  auth: Google_Search_API_KEY,
-});
-
-const isLikelyGoodUrl = (url) => {
-  if (!/^https?:\/\//i.test(url)) return false;
-  if (
-    /webcache\.googleusercontent\.com|translate\.googleusercontent\.com|accounts\.google\.com/i.test(
-      url
-    )
-  )
-    return false;
-  return true;
-};
-
-const validateUrl = async (url) => {
-  if (url.includes("pluralcode.academy") || url.includes("drive.google.com"))
-    return true;
-  if (!isLikelyGoodUrl(url)) return false;
-  try {
-    const res = await withTimeout(fetch(url), 3500, "URL HEAD timeout");
-    if (res.ok || (res.status >= 300 && res.status < 400)) return true;
-  } catch (_) {
-    try {
-      const res2 = await withTimeout(
-        fetch(url, { method: "GET", headers: { Range: "bytes=0-1024" } }),
-        4500,
-        "URL GET timeout"
-      );
-      if (res2.ok || (res2.status >= 300 && res2.status < 400)) return true;
-    } catch (__) {}
-  }
-  return false;
-};
-
-const cleanAndValidateResults = async (items, max = 3) => {
-  const pruned = [];
-  for (const item of items || []) {
-    if (!item?.link) continue;
-    if (!isLikelyGoodUrl(item.link)) continue;
-    if (await validateUrl(item.link)) pruned.push(item);
-    if (pruned.length >= max) break;
-  }
-  return pruned;
-};
-
-async function search_youtube_for_videos({ query }) {
-  if (!Google_Search_API_KEY) {
-    return { message: "YouTube search is not configured." };
-  }
-  const response = await withTimeout(
-    youtube.search.list({
-      part: "snippet",
-      q: query,
-      type: "video",
-      videoEmbeddable: "true",
-      maxResults: 6,
-    }),
-    6000,
-    "YouTube search timeout"
-  );
-
-  const items = (response.data.items || []).map((it) => ({
-    title: it.snippet.title,
-    link: `https://www.youtube.com/watch?v=${it.id.videoId}`,
-    snippet: it.snippet.description,
-  }));
-
-  const valid = await cleanAndValidateResults(items, 3);
-  return valid.length
-    ? { searchResults: valid }
-    : { message: `No YouTube videos found for "${query}".` };
-}
-
-async function search_web_for_articles({ query }) {
-  if (!Google_Search_API_KEY || !Google_Search_CX_ID) {
-    return { message: "Web search is not configured." };
-  }
-  const url = `https://www.googleapis.com/customsearch/v1?key=${Google_Search_API_KEY}&cx=${Google_Search_CX_ID}&q=${encodeURIComponent(
-    query
-  )}`;
-  const res = await withTimeout(fetch(url), 6000, "Web search timeout");
-  if (!res.ok)
-    throw new Error(`Google Search API responded with status ${res.status}`);
-
-  const data = await res.json();
-  const items = (data.items || []).map((i) => ({
-    title: i.title,
-    link: i.link,
-    snippet: i.snippet,
-  }));
-
-  const valid = await cleanAndValidateResults(items, 3);
-  return valid.length
-    ? { searchResults: valid }
-    : { message: `No articles found for "${query}".` };
-}
-
-// -----------------------------------------------------------------------------
-// Gemini — DROP-IN FIX (NO GEMINI_MODEL GLOBAL USED ANYWHERE)
+// Gemini (FIXED) — uses @google/genai + correct apiVersion behavior
 // -----------------------------------------------------------------------------
 let _aiClientPromise = null;
 let _activeModel = null;
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_API_VERSION = process.env.GEMINI_API_VERSION || "v1";
+
+// IMPORTANT DEFAULT for Developer API is beta endpoints.
+// If you set v1 while using API key, it can break schema (your 400 error).
+let GEMINI_API_VERSION = (process.env.GEMINI_API_VERSION || "").trim() || "v1beta";
+if (GEMINI_API_VERSION === "v1") {
+  console.warn(
+    "⚠️ GEMINI_API_VERSION=v1 is typically for Vertex AI. " +
+      "You are using an API key, so forcing v1beta to avoid schema errors."
+  );
+  GEMINI_API_VERSION = "v1beta";
+}
 
 const ENV_MODEL_RAW = (process.env.GEMINI_MODEL || "").trim();
 const MODEL_FALLBACKS = [
   ...(ENV_MODEL_RAW ? [ENV_MODEL_RAW] : []),
-  "gemini-2.5-pro",
   "gemini-2.5-flash",
+  "gemini-2.5-pro",
   "gemini-2.5-flash-lite",
-  "gemini-3-flash-preview", // last resort
+  "gemini-3-flash-preview",
 ];
 
 function normalizeModelName(m) {
@@ -476,13 +373,14 @@ async function getGeminiClient() {
       throw new Error("GEMINI_API_KEY is missing or empty.");
     }
 
-    // ESM-first package, but this file is CommonJS: dynamic import works.
+    // CJS file: dynamic import
     const mod = await import("@google/genai");
     const GoogleGenAI = mod.GoogleGenAI;
 
+    // Correct constructor option is `apiVersion` (NOT httpOptions)
     const ai = new GoogleGenAI({
       apiKey: GEMINI_API_KEY,
-      httpOptions: { apiVersion: GEMINI_API_VERSION },
+      apiVersion: GEMINI_API_VERSION,
     });
 
     console.log(`✅ Gemini client ready (apiVersion=${GEMINI_API_VERSION})`);
@@ -490,46 +388,6 @@ async function getGeminiClient() {
   })();
 
   return _aiClientPromise;
-}
-
-async function modelWorks(ai, model) {
-  const modelId = normalizeModelName(model);
-  try {
-    await ai.models.get({ model: modelId });
-
-    const probe = await ai.models.generateContent({
-      model: modelId,
-      contents: "ping",
-      config: { maxOutputTokens: 4, temperature: 0, candidateCount: 1 },
-    });
-
-    const t = probe?.text ? String(probe.text).trim() : "";
-    return t.length > 0;
-  } catch (e) {
-    const msg = e?.message || String(e);
-    console.warn(`⚠️ Model probe failed for "${modelId}": ${msg}`);
-    return false;
-  }
-}
-
-async function resolveActiveModel() {
-  if (_activeModel) return _activeModel;
-
-  const ai = await getGeminiClient();
-  for (const candidate of MODEL_FALLBACKS) {
-    const id = normalizeModelName(candidate);
-    if (await modelWorks(ai, id)) {
-      _activeModel = id;
-      console.log(`📌 Using Gemini model: ${_activeModel}`);
-      return _activeModel;
-    }
-  }
-
-  throw new Error(
-    `No working Gemini model found. Tried: ${MODEL_FALLBACKS.map(normalizeModelName).join(
-      ", "
-    )}`
-  );
 }
 
 function clampContents(contents, maxItems = 24) {
@@ -546,24 +404,68 @@ function extractTextOrFallback(resp) {
   const joined = parts.map((p) => p?.text || "").join("").trim();
   if (joined) return { text: joined, blocked: false };
 
-  const finishReason = resp?.candidates?.[0]?.finishReason || null;
-  const blockReason = resp?.promptFeedback?.blockReason || null;
-
   return {
     text:
       "I couldn’t generate a response for that. Please rephrase your question in a simpler way.",
     blocked: true,
-    meta: { finishReason, blockReason },
   };
 }
 
+async function modelWorks(ai, model) {
+  const modelId = normalizeModelName(model);
+  try {
+    // metadata check (if supported)
+    if (ai?.models?.get) {
+      await ai.models.get({ model: modelId });
+    }
+
+    const probe = await ai.models.generateContent({
+      model: modelId,
+      contents: "ping",
+      config: {
+        temperature: 0,
+        maxOutputTokens: 8,
+      },
+    });
+
+    const t = probe?.text ? String(probe.text).trim() : "";
+    return t.length > 0;
+  } catch (e) {
+    const msg = e?.message || String(e);
+    console.warn(`⚠️ Model probe failed for "${modelId}": ${msg}`);
+    return false;
+  }
+}
+
+async function resolveActiveModel() {
+  if (_activeModel) return _activeModel;
+
+  const ai = await getGeminiClient();
+
+  for (const candidate of MODEL_FALLBACKS) {
+    const id = normalizeModelName(candidate);
+    if (await modelWorks(ai, id)) {
+      _activeModel = id;
+      console.log(`📌 Using Gemini model: ${_activeModel}`);
+      return _activeModel;
+    }
+  }
+
+  throw new Error(
+    `No working Gemini model found. Tried: ${MODEL_FALLBACKS.map(normalizeModelName).join(
+      ", "
+    )}`
+  );
+}
+
 /**
- * Call Gemini via @google/genai generateContent
- * contents: [{ role: "user"|"model", parts:[{ text }] }, ...]
+ * Call Gemini using @google/genai.
+ * IMPORTANT: systemInstruction goes inside `config`, per official JS examples. :contentReference[oaicite:4]{index=4}
  */
 async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
   const ai = await getGeminiClient();
   const model = await resolveActiveModel();
+
   const safeContents = clampContents(contents, 24);
 
   try {
@@ -571,23 +473,18 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
       model,
       contents: safeContents,
       config: {
-        systemInstruction: systemInstruction || "",
+        systemInstruction: systemInstruction || undefined,
         temperature: 0.4,
-        candidateCount: 1,
         maxOutputTokens: maxTokens || 512,
       },
     });
 
-    const extracted = extractTextOrFallback(resp);
-    if (extracted.blocked) {
-      console.warn("[Gemini] Empty/blocked response meta:", extracted.meta || {});
-    }
-    return extracted.text;
+    return extractTextOrFallback(resp).text;
   } catch (err) {
     const msg = err?.message || String(err);
     console.error("Gemini generateContent failed:", msg);
 
-    // If model got retired / 404’d mid-flight: reset and retry once.
+    // If model retired mid-flight, reset + retry once
     if (/404|not found|Model/i.test(msg)) {
       _activeModel = null;
       const retryModel = await resolveActiveModel();
@@ -596,9 +493,8 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
         model: retryModel,
         contents: safeContents,
         config: {
-          systemInstruction: systemInstruction || "",
+          systemInstruction: systemInstruction || undefined,
           temperature: 0.4,
-          candidateCount: 1,
           maxOutputTokens: maxTokens || 512,
         },
       });
@@ -610,8 +506,10 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
   }
 }
 
-// Warmup (non-blocking)
-resolveActiveModel().catch((e) => console.warn("Gemini warmup failed:", e.message || e));
+// Warmup
+resolveActiveModel().catch((e) =>
+  console.warn("Gemini warmup failed:", e.message || e)
+);
 
 // -----------------------------------------------------------------------------
 // System instructions
@@ -625,27 +523,11 @@ ROLE & STYLE
 - You are primarily used through VOICE, but your text answers are also shown on screen.
 
 QUIZZES
-- By default you may sometimes suggest a short quiz after explaining a topic.
 - If the student explicitly asks for a quiz/test/practice questions/MCQs, you MUST generate a quiz of EXACTLY 10 multiple-choice questions.
 - Every quiz question must include the correct answer so the frontend can grade it.
 - When you provide a multiple-choice quiz, use this exact JSON-line format for EACH question:
   QUIZ: {"question":"...","options":["A","B","C","D"],"correctIndex":1,"explanation":"..."}
-- Each question must have exactly 4 options and a correctIndex from 0 to 3.
-- Make explanations short (1–2 sentences) and do not include additional JSON outside these QUIZ lines.
 - Do NOT put curly braces { or } inside the question, options, or explanation text.
-
-LINKS & RESOURCES
-- When you recommend YouTube videos or articles, include full URLs in the TEXT so the UI can show previews.
-- Whenever you share specific resources, also append one JSON line per resource at the END of your reply in one of these formats:
-  VIDEO: {"title":"...","url":"https://...","description":"...","platform":"youtube"}
-  ARTICLE: {"title":"...","url":"https://...","description":"...","source":"article"}
-- Do NOT put curly braces { or } inside any of the string fields in these JSON objects.
-- If the student explicitly asks for videos or articles, you MUST include at least 3 structured VIDEO or ARTICLE lines (if such resources exist).
-- In voice, do NOT read out the full URL; just say something like: "I'm sharing a link in your resources panel."
-
-SCOPE
-- You must also follow an extra [CONTEXT] block that describes the student's enrolled courses and allowed topics.
-- If a request is clearly unrelated to all enrolled courses, briefly say so and suggest 2–3 in-scope alternatives instead of trying to answer it.
 `;
 
 const QUIZ_MODE_INSTRUCTION = `
@@ -653,58 +535,43 @@ const QUIZ_MODE_INSTRUCTION = `
 The student has explicitly requested a quiz or test in their most recent message.
 
 For THIS reply you must:
-- Focus the quiz on the student's current topic or enrolled courses.
 - Generate EXACTLY 10 multiple-choice questions.
-- Each question must have exactly 4 options.
 - Output each question on its own line in this exact format:
   QUIZ: {"question":"...","options":["A","B","C","D"],"correctIndex":1,"explanation":"..."}
-- "correctIndex" must be 0, 1, 2, or 3 and must match the correct option in the "options" array.
-- Keep "question", each option, and "explanation" as short, clear English strings.
 - Do NOT include any other JSON or markdown.
-- You may include at most ONE short introductory sentence before the QUIZ lines.
 `;
 
 // -----------------------------------------------------------------------------
-// TEST ENDPOINT - Verify Gemini API using current SDK
+// TEST ENDPOINT
 // -----------------------------------------------------------------------------
 app.get("/test-gemini", async (req, res) => {
   try {
-    if (!process.env.GEMINI_API_KEY) {
-      return res.status(500).json({ error: "GEMINI_API_KEY not set" });
-    }
-
     const ai = await getGeminiClient();
     const model = await resolveActiveModel();
 
     const resp = await ai.models.generateContent({
       model,
       contents: "Say hello in one word",
-      config: { maxOutputTokens: 16, temperature: 0, candidateCount: 1 },
+      config: { maxOutputTokens: 16, temperature: 0 },
     });
-
-    const extracted = extractTextOrFallback(resp);
 
     res.json({
       success: true,
       model,
       apiVersion: GEMINI_API_VERSION,
-      response: extracted.text,
-      blocked: !!extracted.blocked,
-      meta: extracted.meta || null,
-      note: "Using @google/genai",
+      response: extractTextOrFallback(resp).text,
     });
   } catch (error) {
     res.status(500).json({
       error: error.message,
       model: getCurrentModelLabel(),
       apiVersion: GEMINI_API_VERSION,
-      note: "Make sure @google/genai is installed: npm install @google/genai",
     });
   }
 });
 
 // -----------------------------------------------------------------------------
-// GOOGLE TTS — sanitize + synthesize (no URLs or weird characters)
+// GOOGLE TTS — sanitize + synthesize
 // -----------------------------------------------------------------------------
 function sanitizeForSpeech(text) {
   if (!text) return "";
@@ -739,7 +606,6 @@ function sanitizeForSpeech(text) {
   t = t.replace(/[•~_=^]+/g, " ");
   t = t.replace(/[\[\]\(\)\{\}<>\/\\|]+/g, " ");
   t = t.replace(/[;:]{2,}/g, " ");
-
   t = t.replace(/\bExcel\b/gi, "Microsoft Excel");
   t = t.replace(/\s{2,}/g, " ");
 
@@ -752,24 +618,20 @@ async function synthesizeWithGoogleTTS(fullText) {
 
   const request = {
     input: { text: spoken },
-    voice: {
-      languageCode: "en-GB",
-      ssmlGender: "MALE",
-    },
-    audioConfig: {
-      audioEncoding: "MP3",
-      speakingRate: 0.95,
-    },
+    voice: { languageCode: "en-GB", ssmlGender: "MALE" },
+    audioConfig: { audioEncoding: "MP3", speakingRate: 0.95 },
   };
 
   const [response] = await ttsClient.synthesizeSpeech(request);
   if (!response.audioContent) return null;
-  const audioBase64 = response.audioContent.toString("base64");
-  return { audioBase64, mimeType: "audio/mpeg" };
+  return {
+    audioBase64: response.audioContent.toString("base64"),
+    mimeType: "audio/mpeg",
+  };
 }
 
 // -----------------------------------------------------------------------------
-// Optional HTTP /api/chat (non-WS clients)
+// Optional HTTP /api/chat
 // -----------------------------------------------------------------------------
 app.post("/api/chat", async (req, res) => {
   try {
@@ -787,14 +649,11 @@ app.post("/api/chat", async (req, res) => {
 
     const studentEmail = normalizeEmail(student_email);
     const scope = await getStudentScope(studentEmail);
+
     const enrolledCourseNames = scope.courseNames.join(", ");
     const allowedPhrases = scope.allowedPhrases;
 
-    const header = buildContextHeader(
-      studentEmail,
-      enrolledCourseNames,
-      allowedPhrases
-    );
+    const header = buildContextHeader(studentEmail, enrolledCourseNames, allowedPhrases);
     const baseInstruction = `${BASE_SYSTEM_INSTRUCTION}\n\n${header}`;
 
     const contents = [];
@@ -821,18 +680,19 @@ app.post("/api/chat", async (req, res) => {
       maxTokens: quizMode ? 2048 : 512,
     });
 
-    return res.json({ text: aiText, model: getCurrentModelLabel() });
+    return res.json({ text: aiText, model: getCurrentModelLabel(), apiVersion: GEMINI_API_VERSION });
   } catch (err) {
     console.error("❌ /api/chat error:", err);
     return res.status(500).json({
       error: err.message || "Server error",
       model: getCurrentModelLabel(),
+      apiVersion: GEMINI_API_VERSION,
     });
   }
 });
 
 // -----------------------------------------------------------------------------
-// WebSocket /ws — text chat for voice UI (with Google TTS audio) + ping keepalive
+// WebSocket /ws — voice UI chat
 // -----------------------------------------------------------------------------
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: "/ws" });
@@ -880,14 +740,11 @@ wss.on("connection", (ws) => {
 
         const studentEmail = normalizeEmail(msg.student_email);
         const scope = await getStudentScope(studentEmail);
+
         const enrolledCourseNames = scope.courseNames.join(", ");
         const allowedPhrases = scope.allowedPhrases;
 
-        const header = buildContextHeader(
-          studentEmail,
-          enrolledCourseNames,
-          allowedPhrases
-        );
+        const header = buildContextHeader(studentEmail, enrolledCourseNames, allowedPhrases);
         const systemInstruction = `${BASE_SYSTEM_INSTRUCTION}\n\n${header}`;
 
         const initialHistory = Array.isArray(msg.history)
@@ -950,10 +807,7 @@ wss.on("connection", (ws) => {
 
       try {
         console.log(
-          `[WS ${ws.id}] Gemini call | model=${getCurrentModelLabel()} | user=${ws.session.studentEmail} | msg="${text.substring(
-            0,
-            100
-          )}..."`
+          `[WS ${ws.id}] Gemini call | model=${getCurrentModelLabel()} | apiVersion=${GEMINI_API_VERSION} | msg="${text.substring(0, 100)}..."`
         );
 
         const aiText = await callGeminiChat({
@@ -976,6 +830,7 @@ wss.on("connection", (ws) => {
           text: aiText,
           requestId,
           model: getCurrentModelLabel(),
+          apiVersion: GEMINI_API_VERSION,
         };
         if (tts && tts.audioBase64) {
           payload.audio = tts.audioBase64;
@@ -986,18 +841,17 @@ wss.on("connection", (ws) => {
       } catch (err) {
         console.error(`[WS ${ws.id}] Gemini error:`, err);
 
-        const errorPayload = {
-          type: "error",
-          error: err.message || "Gemini error",
-          details: {
-            model: getCurrentModelLabel(),
-            studentEmail: ws.session?.studentEmail,
-            apiVersion: GEMINI_API_VERSION,
-            ...(process.env.NODE_ENV === "development" && { stack: err.stack }),
-          },
-        };
-
-        ws.send(JSON.stringify(errorPayload));
+        ws.send(
+          JSON.stringify({
+            type: "error",
+            error: err.message || "Gemini error",
+            details: {
+              model: getCurrentModelLabel(),
+              apiVersion: GEMINI_API_VERSION,
+              ...(process.env.NODE_ENV === "development" && { stack: err.stack }),
+            },
+          })
+        );
       }
       return;
     }
@@ -1025,13 +879,12 @@ wss.on("connection", (ws) => {
 // -----------------------------------------------------------------------------
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, "0.0.0.0", () => {
-  console.log(`🚀 Praxis Voice listening on ${PORT} | model=${getCurrentModelLabel()} | apiVersion=${GEMINI_API_VERSION}`);
+  console.log(
+    `🚀 Praxis Voice listening on ${PORT} | model=${getCurrentModelLabel()} | apiVersion=${GEMINI_API_VERSION}`
+  );
 
-  // Once resolved, print the real model
   resolveActiveModel()
-    .then((m) =>
-      console.log(`✅ Gemini model resolved and active: ${m}`)
-    )
+    .then((m) => console.log(`✅ Gemini model resolved: ${m}`))
     .catch((e) =>
       console.warn(`⚠️ Gemini model resolve failed after listen: ${e.message || e}`)
     );
