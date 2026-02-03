@@ -575,33 +575,70 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
 
     // Get model and start chat with history (important for voice conversation continuity)
     const model = genAI.getGenerativeModel(modelConfig);
-    const chat = model.startChat({ history });
-
-    // Send current user message (from voice input)
-    console.log(`[Gemini] Sending message to ${GEMINI_MODEL}...`);
-    const result = await chat.sendMessage(currentUserMessage);
-    const response = await result.response;
     
-    // Debug: Log full response structure
-    console.log(`[Gemini] Full response object:`, JSON.stringify({
-      hasResponse: !!response,
-      responseType: typeof response,
-      responseKeys: response ? Object.keys(response) : [],
-      candidates: response?.candidates?.length || 0,
-      finishReason: response?.candidates?.[0]?.finishReason,
-      parts: response?.candidates?.[0]?.content?.parts?.length || 0,
-      hasTextMethod: typeof response?.text === 'function'
-    }, null, 2));
-    
-    // Get text from response - handle different response formats
+    // If no history, use generateContent instead of startChat (simpler for first message)
     let text = "";
-    try {
-      // Primary method: use response.text()
-      if (typeof response.text === 'function') {
+    let response = null; // Declare response in outer scope
+    
+    if (history.length === 0) {
+      console.log(`[Gemini] No history - using generateContent for ${GEMINI_MODEL}...`);
+      console.log(`[Gemini] Message: "${currentUserMessage.substring(0, 100)}..."`);
+      
+      const result = await model.generateContent(currentUserMessage);
+      response = await result.response;
+      
+      try {
         text = response.text();
-        console.log(`[Gemini] Got text via response.text(), length: ${text?.length || 0}, preview: "${text?.substring(0, 50)}..."`);
-      } else {
-        console.warn(`[Gemini] response.text is not a function, trying alternative extraction`);
+        console.log(`[Gemini] Got text via generateContent, length: ${text?.length || 0}`);
+      } catch (textError) {
+        console.error("[Gemini] Error calling response.text() in generateContent:", textError);
+        const parts = response?.candidates?.[0]?.content?.parts || [];
+        text = parts.map(p => p.text || "").join(" ");
+      }
+    } else {
+      // Use chat for conversation continuity
+      const chat = model.startChat({ history });
+      console.log(`[Gemini] Using chat with history (${history.length} messages) for ${GEMINI_MODEL}...`);
+      console.log(`[Gemini] Message: "${currentUserMessage.substring(0, 100)}..."`);
+      
+      const result = await chat.sendMessage(currentUserMessage);
+      response = await result.response;
+    
+      // Debug: Log full response structure - capture everything
+      const responseDebug = {
+        hasResponse: !!response,
+        responseType: typeof response,
+        responseKeys: response ? Object.keys(response) : [],
+        candidates: response?.candidates?.length || 0,
+        finishReason: response?.candidates?.[0]?.finishReason,
+        parts: response?.candidates?.[0]?.content?.parts?.length || 0,
+        hasTextMethod: typeof response?.text === 'function',
+        fullResponseString: JSON.stringify(response, null, 2).substring(0, 1000) // First 1000 chars
+      };
+      console.log(`[Gemini] Full response debug:`, JSON.stringify(responseDebug, null, 2));
+      
+      // Get text from response - handle different response formats
+      try {
+        // Primary method: use response.text()
+        if (typeof response.text === 'function') {
+          text = response.text();
+          console.log(`[Gemini] Got text via response.text(), length: ${text?.length || 0}, preview: "${text?.substring(0, 50)}..."`);
+        } else {
+          console.warn(`[Gemini] response.text is not a function, trying alternative extraction`);
+          // Fallback: extract from parts directly
+          const candidates = response?.candidates || [];
+          if (candidates.length > 0) {
+            const parts = candidates[0]?.content?.parts || [];
+            for (const part of parts) {
+              if (part.text) {
+                text += part.text;
+              }
+            }
+            console.log(`[Gemini] Got text via parts extraction, length: ${text?.length || 0}`);
+          }
+        }
+      } catch (textError) {
+        console.error("[Gemini] Error calling response.text():", textError);
         // Fallback: extract from parts directly
         const candidates = response?.candidates || [];
         if (candidates.length > 0) {
@@ -611,21 +648,8 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
               text += part.text;
             }
           }
-          console.log(`[Gemini] Got text via parts extraction, length: ${text?.length || 0}`);
+          console.log(`[Gemini] Got text via parts extraction (after error), length: ${text?.length || 0}`);
         }
-      }
-    } catch (textError) {
-      console.error("[Gemini] Error calling response.text():", textError);
-      // Fallback: extract from parts directly
-      const candidates = response?.candidates || [];
-      if (candidates.length > 0) {
-        const parts = candidates[0]?.content?.parts || [];
-        for (const part of parts) {
-          if (part.text) {
-            text += part.text;
-          }
-        }
-        console.log(`[Gemini] Got text via parts extraction (after error), length: ${text?.length || 0}`);
       }
     }
     
@@ -642,7 +666,10 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
         hasCandidates: !!response?.candidates?.length,
         candidateCount: response?.candidates?.length || 0,
         model: GEMINI_MODEL,
-        fullResponse: JSON.stringify(response, null, 2).substring(0, 500) // First 500 chars for debugging
+        fullResponse: JSON.stringify(response, null, 2).substring(0, 1000), // First 1000 chars for debugging
+        responseKeys: response ? Object.keys(response) : [],
+        hasTextMethod: typeof response?.text === 'function',
+        candidatesStructure: response?.candidates?.[0] ? Object.keys(response.candidates[0]) : []
       };
       
       console.error("[Gemini] Empty response details:", JSON.stringify(responseDetails, null, 2));
