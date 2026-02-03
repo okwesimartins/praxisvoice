@@ -569,10 +569,66 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
     // Send current user message (from voice input)
     const result = await chat.sendMessage(currentUserMessage);
     const response = await result.response;
-    const text = response.text();
+    
+    // Debug: Log response structure
+    console.log(`[Gemini] Response structure:`, {
+      hasResponse: !!response,
+      candidates: response?.candidates?.length || 0,
+      finishReason: response?.candidates?.[0]?.finishReason,
+      parts: response?.candidates?.[0]?.content?.parts?.length || 0
+    });
+    
+    // Get text from response - handle different response formats
+    let text = "";
+    try {
+      // Primary method: use response.text()
+      text = response.text();
+      console.log(`[Gemini] Got text via response.text(), length: ${text?.length || 0}`);
+    } catch (textError) {
+      console.error("[Gemini] Error calling response.text():", textError);
+      // Fallback: extract from parts directly
+      const candidates = response?.candidates || [];
+      if (candidates.length > 0) {
+        const parts = candidates[0]?.content?.parts || [];
+        for (const part of parts) {
+          if (part.text) {
+            text += part.text;
+          }
+        }
+        console.log(`[Gemini] Got text via parts extraction, length: ${text?.length || 0}`);
+      }
+    }
+    
+    // If still no text, check for blocked content or errors
+    if (!text || text.trim() === "") {
+      const finishReason = response?.candidates?.[0]?.finishReason;
+      const safetyRatings = response?.candidates?.[0]?.safetyRatings || [];
+      const responseDetails = {
+        finishReason,
+        safetyRatings: safetyRatings.map(r => ({ 
+          category: r.category, 
+          probability: r.probability 
+        })),
+        hasCandidates: !!response?.candidates?.length,
+        candidateCount: response?.candidates?.length || 0,
+        model: GEMINI_MODEL
+      };
+      
+      console.error("[Gemini] Empty response details:", responseDetails);
+      
+      // Create error with details to throw to frontend
+      const emptyResponseError = new Error("Empty response from Gemini API");
+      emptyResponseError.responseDetails = responseDetails;
+      emptyResponseError.finishReason = finishReason;
+      emptyResponseError.safetyRatings = safetyRatings;
+      throw emptyResponseError;
+    }
 
     // Return text for TTS synthesis (voice output)
-    return text || "(no response text)";
+    if (!text || text.trim() === "") {
+      throw new Error("Received empty response from Gemini API");
+    }
+    return text.trim();
   } catch (error) {
     console.error("Gemini API call failed:", {
       error: error.message,
@@ -613,10 +669,43 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
         const chat = model.startChat({ history });
         const result = await chat.sendMessage(currentUserMessage);
         const response = await result.response;
-        const text = response.text();
+        
+        let text = "";
+        try {
+          text = response.text();
+        } catch (textError) {
+          const parts = response?.candidates?.[0]?.content?.parts || [];
+          if (parts.length > 0 && parts[0].text) {
+            text = parts[0].text;
+          }
+        }
+        
+        if (!text || text.trim() === "") {
+          const finishReason = response?.candidates?.[0]?.finishReason;
+          const safetyRatings = response?.candidates?.[0]?.safetyRatings || [];
+          console.error(`[Voice] Fallback model ${fallbackModel} returned empty - finishReason:`, finishReason);
+          
+          // If this is the last fallback, throw error with details
+          if (fallbackModel === fallbackModels[fallbackModels.length - 1]) {
+            const emptyResponseError = new Error("All models returned empty response");
+            emptyResponseError.responseDetails = {
+              finishReason,
+              safetyRatings: safetyRatings.map(r => ({ 
+                category: r.category, 
+                probability: r.probability 
+              })),
+              modelsTried: [GEMINI_MODEL, ...fallbackModels],
+              lastModel: fallbackModel
+            };
+            emptyResponseError.finishReason = finishReason;
+            emptyResponseError.safetyRatings = safetyRatings;
+            throw emptyResponseError;
+          }
+          continue;
+        }
 
         console.log(`✅ [Voice] Success with fallback model: ${fallbackModel}`);
-        return text || "(no response text)";
+        return text.trim();
       } catch (fallbackError) {
         console.error(`[Voice] Fallback model ${fallbackModel} also failed:`, fallbackError.message);
         continue;
@@ -940,6 +1029,8 @@ wss.on("connection", (ws) => {
       try {
         // Log WebSocket request for debugging
         console.log(`[WS ${ws.id}] Calling Gemini API for user: ${ws.session.studentEmail}`);
+        console.log(`[WS ${ws.id}] User message: "${text.substring(0, 100)}..."`);
+        console.log(`[WS ${ws.id}] Contents length: ${contents.length}`);
         
         const aiText = await callGeminiChat({
           systemInstruction: finalInstruction,
@@ -948,6 +1039,7 @@ wss.on("connection", (ws) => {
         });
 
         console.log(`[WS ${ws.id}] Gemini API success, response length: ${aiText.length}`);
+        console.log(`[WS ${ws.id}] Response preview: "${aiText.substring(0, 100)}..."`);
         ws.session.history.push({ role: "assistant", text: aiText });
 
         // Voice interaction: Convert AI text response to speech
@@ -977,13 +1069,31 @@ wss.on("connection", (ws) => {
           model: GEMINI_MODEL,
           studentEmail: ws.session?.studentEmail
         });
-        ws.send(
-          JSON.stringify({
-            type: "error",
-            error: err.message || "Gemini error",
-            details: process.env.NODE_ENV === "development" ? err.stack : undefined
-          })
-        );
+        
+        // Send detailed error to frontend for debugging
+        const errorPayload = {
+          type: "error",
+          error: err.message || "Gemini error",
+          details: {
+            model: GEMINI_MODEL,
+            message: err.message,
+            ...(err.responseDetails && { responseDetails: err.responseDetails }),
+            ...(err.finishReason && { finishReason: err.finishReason }),
+            ...(err.safetyRatings && { 
+              safetyRatings: Array.isArray(err.safetyRatings) 
+                ? err.safetyRatings.map(r => ({ 
+                    category: r.category, 
+                    probability: r.probability 
+                  }))
+                : err.safetyRatings
+            }),
+            ...(err.originalError && { originalError: err.originalError.message }),
+            ...(process.env.NODE_ENV === "development" && { stack: err.stack })
+          }
+        };
+        
+        console.log(`[WS ${ws.id}] Sending error to frontend:`, JSON.stringify(errorPayload, null, 2));
+        ws.send(JSON.stringify(errorPayload));
       }
       return;
     }
