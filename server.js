@@ -454,22 +454,21 @@ async function search_web_for_articles({ query }) {
 }
 
 // -----------------------------------------------------------------------------
-// Gemini text API - FIXED VERSION
+// Gemini text API - FIXED VERSION (Using Official SDK like working codebase)
 // -----------------------------------------------------------------------------
+const { GoogleGenerativeAI } = require("@google/generative-ai");
+
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 if (!GEMINI_API_KEY) {
   console.warn("⚠️ GEMINI_API_KEY not set in environment!");
 }
 
-// FIX: Normalize model name properly
-// Common Gemini models: gemini-pro, gemini-1.5-pro, gemini-1.5-flash, gemini-2.0-flash-exp
-const RAW_MODEL = process.env.GEMINI_MODEL || "gemini-pro"; // Use most stable version as default
-let GEMINI_MODEL = RAW_MODEL;
+// Use the official SDK (same as working codebase)
+const genAI = new GoogleGenerativeAI(GEMINI_API_KEY, { apiVersion: 'v1' });
 
-// Ensure model name has "models/" prefix for the API
-if (!GEMINI_MODEL.startsWith("models/")) {
-  GEMINI_MODEL = `models/${GEMINI_MODEL}`;
-}
+// Model name (without "models/" prefix - SDK handles it)
+const RAW_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-pro"; // Use same as working codebase
+const GEMINI_MODEL = RAW_MODEL.replace(/^models\//, ""); // Remove models/ prefix if present
 
 console.log(`📌 Using Gemini model: ${GEMINI_MODEL}`);
 
@@ -527,7 +526,13 @@ For THIS reply you must:
 `;
 
 /**
- * FIXED: Call Gemini text model with proper error handling and fallback
+ * FIXED: Call Gemini using Official SDK (same approach as working codebase)
+ * contents: [{ role: "user"|"model", parts:[{ text }] }, ...]
+ * maxTokens: optional override for maxOutputTokens
+ */
+/**
+ * Call Gemini using Official SDK - Optimized for Voice Interactions
+ * Returns text that will be converted to speech via TTS
  * contents: [{ role: "user"|"model", parts:[{ text }] }, ...]
  * maxTokens: optional override for maxOutputTokens
  */
@@ -536,149 +541,96 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
     throw new Error("GEMINI_API_KEY is missing.");
   }
 
-  // Extract model name without "models/" prefix for URL construction
-  const modelName = GEMINI_MODEL.replace("models/", "");
-
-  // FIX: systemInstruction field is not recognized by Gemini API
-  // Solution: Prepend system instruction to the first user message in contents
-  const formattedContents = contents.map((c, idx) => {
-    const role = c.role === "model" ? "model" : "user";
-    let text = c.parts[0]?.text || "";
-    
-    // Prepend system instruction to the first user message
-    if (idx === 0 && role === "user" && systemInstruction) {
-      text = `${systemInstruction}\n\n${text}`;
-    }
-    
-    return {
-      role,
-      parts: [{ text }]
-    };
-  });
-
-  const body = {
-    contents: formattedContents,
-    generationConfig: {
-      temperature: 0.4,
-      maxOutputTokens: maxTokens || 512,
-    },
-  };
-
-  // Try v1 first (most stable, works with gemini-pro, gemini-1.5-pro, etc.)
-  let url = `https://generativelanguage.googleapis.com/v1/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-
   try {
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
+    // Convert contents to SDK format (preserve conversation history for voice continuity)
+    const history = contents.slice(0, -1).map(c => ({
+      role: c.role === "model" ? "model" : "user",
+      parts: c.parts
+    }));
+
+    // Get the current user message (from voice input)
+    const lastMessage = contents[contents.length - 1];
+    const currentUserMessage = lastMessage?.parts?.[0]?.text || "";
+
+    // Configure model with system instruction (SDK handles this properly)
+    const modelConfig = {
+      model: GEMINI_MODEL,
+      systemInstruction: systemInstruction, // SDK supports this directly - no prepending needed
+      generationConfig: {
+        temperature: 0.4,
+        maxOutputTokens: maxTokens || 512,
       },
-      body: JSON.stringify(body),
+    };
+
+    // Get model and start chat with history (important for voice conversation continuity)
+    const model = genAI.getGenerativeModel(modelConfig);
+    const chat = model.startChat({ history });
+
+    // Send current user message (from voice input)
+    const result = await chat.sendMessage(currentUserMessage);
+    const response = await result.response;
+    const text = response.text();
+
+    // Return text for TTS synthesis (voice output)
+    return text || "(no response text)";
+  } catch (error) {
+    console.error("Gemini API call failed:", {
+      error: error.message,
+      stack: error.stack,
+      model: GEMINI_MODEL
     });
 
-    if (!res.ok) {
-      const errText = await res.text();
-      let errData;
+    // Try fallback models if primary fails (important for voice reliability)
+    const fallbackModels = [
+      "gemini-2.5-pro",
+      "gemini-1.5-pro",
+      "gemini-1.5-flash",
+      "gemini-pro"
+    ].filter(m => m !== GEMINI_MODEL);
+
+    for (const fallbackModel of fallbackModels) {
       try {
-        errData = JSON.parse(errText);
-      } catch (_) {
-        errData = { raw: errText };
-      }
-
-      console.error("Gemini API error response:", {
-        status: res.status,
-        statusText: res.statusText,
-        model: GEMINI_MODEL,
-        endpoint: "v1",
-        error: errData,
-        url: url.replace(GEMINI_API_KEY, "REDACTED")
-      });
-
-      // If 404, try alternative models or v1beta
-      if (res.status === 404) {
-        console.log(`⚠️ Model ${GEMINI_MODEL} not found. Trying fallback models...`);
+        console.log(`[Voice] Trying fallback model: ${fallbackModel}`);
         
-        // Try common fallback models
-        const fallbackModels = [
-          "models/gemini-pro",           // Most stable
-          "models/gemini-1.5-pro",       // Latest stable
-          "models/gemini-1.5-flash",     // Fast version
-          "models/gemini-2.0-flash-exp"  // Experimental
-        ];
+        const history = contents.slice(0, -1).map(c => ({
+          role: c.role === "model" ? "model" : "user",
+          parts: c.parts
+        }));
 
-        // Remove current model from fallbacks if it's already there
-        const modelsToTry = fallbackModels.filter(m => m !== GEMINI_MODEL);
+        const lastMessage = contents[contents.length - 1];
+        const currentUserMessage = lastMessage?.parts?.[0]?.text || "";
 
-        for (const fallbackModel of modelsToTry) {
-          console.log(`Trying fallback model: ${fallbackModel}`);
-          
-          // Try v1 first
-          const fallbackUrl = `https://generativelanguage.googleapis.com/v1/${fallbackModel}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-          
-          const fallbackRes = await fetch(fallbackUrl, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-            },
-            body: JSON.stringify(body),
-          });
+        const modelConfig = {
+          model: fallbackModel,
+          systemInstruction: systemInstruction,
+          generationConfig: {
+            temperature: 0.4,
+            maxOutputTokens: maxTokens || 512,
+          },
+        };
 
-          if (fallbackRes.ok) {
-            console.log(`✅ Success with model: ${fallbackModel}`);
-            const fallbackData = await fallbackRes.json();
-            const parts =
-              fallbackData.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean) ||
-              [];
-            return parts.join(" ").trim() || "(no response text)";
-          }
+        const model = genAI.getGenerativeModel(modelConfig);
+        const chat = model.startChat({ history });
+        const result = await chat.sendMessage(currentUserMessage);
+        const response = await result.response;
+        const text = response.text();
 
-          // If v1 fails, try v1beta for experimental models
-          if (fallbackModel.includes("exp") || fallbackModel.includes("flash")) {
-            const v1betaUrl = `https://generativelanguage.googleapis.com/v1beta/${fallbackModel}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-            
-            const v1betaRes = await fetch(v1betaUrl, {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify(body),
-            });
-
-            if (v1betaRes.ok) {
-              console.log(`✅ Success with model (v1beta): ${fallbackModel}`);
-              const v1betaData = await v1betaRes.json();
-              const parts =
-                v1betaData.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean) ||
-                [];
-              return parts.join(" ").trim() || "(no response text)";
-            }
-          }
-        }
-
-        // All models failed
-        throw new Error(
-          `Gemini API error: Model ${GEMINI_MODEL} not found. Tried fallbacks: ${modelsToTry.join(", ")}. Please set GEMINI_MODEL to a valid model name (e.g., gemini-pro, gemini-1.5-pro).`
-        );
+        console.log(`✅ [Voice] Success with fallback model: ${fallbackModel}`);
+        return text || "(no response text)";
+      } catch (fallbackError) {
+        console.error(`[Voice] Fallback model ${fallbackModel} also failed:`, fallbackError.message);
+        continue;
       }
-
-      throw new Error(
-        `Gemini API error: ${res.status} - ${JSON.stringify(errData)}`
-      );
     }
 
-    const data = await res.json();
-    const parts =
-      data.candidates?.[0]?.content?.parts?.map((p) => p.text).filter(Boolean) ||
-      [];
-    return parts.join(" ").trim() || "(no response text)";
-  } catch (error) {
-    console.error("Gemini API call failed:", error);
-    throw error;
+    throw new Error(
+      `Gemini API error: ${error.message}. Tried fallbacks: ${fallbackModels.join(", ")}`
+    );
   }
 }
 
 // -----------------------------------------------------------------------------
-// TEST ENDPOINT - Add this to verify your API key and model
+// TEST ENDPOINT - Verify API key and model using SDK
 // -----------------------------------------------------------------------------
 app.get("/test-gemini", async (req, res) => {
   try {
@@ -686,63 +638,24 @@ app.get("/test-gemini", async (req, res) => {
       return res.status(500).json({ error: "GEMINI_API_KEY not set" });
     }
 
-    const modelName = GEMINI_MODEL.replace("models/", "");
-    
-    // Test v1beta
-    const v1betaUrl = `https://generativelanguage.googleapis.com/v1beta/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-    
-    const testBody = {
-      contents: [{
-        parts: [{ text: "Say hello in one word" }]
-      }]
-    };
-
     console.log(`Testing Gemini API with model: ${GEMINI_MODEL}`);
 
-    const v1betaRes = await fetch(v1betaUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(testBody)
-    });
-
-    const v1betaData = await v1betaRes.json();
-
-    if (v1betaRes.ok) {
-      return res.json({
-        success: true,
-        endpoint: "v1beta",
-        model: GEMINI_MODEL,
-        response: v1betaData.candidates?.[0]?.content?.parts?.[0]?.text || "No text in response"
-      });
-    }
-
-    // If v1beta fails, try v1
-    const v1Url = `https://generativelanguage.googleapis.com/v1/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(GEMINI_API_KEY)}`;
-    
-    const v1Res = await fetch(v1Url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(testBody)
-    });
-
-    const v1Data = await v1Res.json();
+    const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
+    const result = await model.generateContent("Say hello in one word");
+    const response = await result.response;
+    const text = response.text();
 
     res.json({
-      success: v1Res.ok,
-      v1beta: {
-        status: v1betaRes.status,
-        error: v1betaData
-      },
-      v1: {
-        status: v1Res.status,
-        response: v1Res.ok ? (v1Data.candidates?.[0]?.content?.parts?.[0]?.text || "No text") : v1Data
-      },
-      model: GEMINI_MODEL
+      success: true,
+      model: GEMINI_MODEL,
+      response: text,
+      note: "Using @google/generative-ai SDK"
     });
   } catch (error) {
     res.status(500).json({ 
       error: error.message,
-      stack: error.stack 
+      model: GEMINI_MODEL,
+      note: "Make sure @google/generative-ai package is installed: npm install @google/generative-ai"
     });
   }
 });
@@ -1037,20 +950,22 @@ wss.on("connection", (ws) => {
         console.log(`[WS ${ws.id}] Gemini API success, response length: ${aiText.length}`);
         ws.session.history.push({ role: "assistant", text: aiText });
 
+        // Voice interaction: Convert AI text response to speech
         let tts = null;
         try {
           tts = await synthesizeWithGoogleTTS(aiText);
         } catch (ttsErr) {
-          console.error("Google TTS error:", ttsErr);
+          console.error("[Voice] Google TTS error:", ttsErr);
         }
 
+        // Send both text (for display) and audio (for voice playback)
         const payload = {
           type: "assistant_text",
-          text: aiText,
+          text: aiText, // Text for UI display
           requestId,
         };
         if (tts && tts.audioBase64) {
-          payload.audio = tts.audioBase64;
+          payload.audio = tts.audioBase64; // Audio for voice playback
           payload.audioMime = tts.mimeType;
         }
 
