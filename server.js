@@ -1,11 +1,20 @@
 /**
- * FIXED server.js — Praxis Voice Backend (Gemini text + Google TTS + WebSocket)
- * 
- * FIXES APPLIED:
- * 1. Fixed Gemini API endpoint - added fallback to v1 if v1beta fails
- * 2. Fixed model name handling - properly handles with/without "models/" prefix
- * 3. Added better error logging to identify the exact issue
- * 4. Added test endpoint to verify API key and model
+ * server.js — Praxis Voice Backend (Gemini + Google TTS + WebSocket)
+ *
+ * ✅ DROP-IN FIX (Jan/Feb 2026 safe):
+ * - Removes hard-coded GEMINI_MODEL variable usage everywhere
+ * - Uses the current official Node SDK: @google/genai (dynamic import for CJS)
+ * - Auto-probes working models and survives “404 model not found”
+ * - Never crashes the voice flow on “empty response” — returns a safe fallback sentence
+ *
+ * IMPORTANT:
+ *   npm uninstall @google/generative-ai
+ *   npm install @google/genai
+ *
+ * ENV:
+ *   GEMINI_API_KEY=...
+ *   (optional) GEMINI_MODEL=gemini-2.5-flash   // recommended for voice latency
+ *   (optional) GEMINI_API_VERSION=v1
  */
 
 if (process.env.NODE_ENV !== "production") {
@@ -34,12 +43,8 @@ const fetch = (...args) => fetchFn(...args);
 const ttsClient = new textToSpeech.TextToSpeechClient();
 
 // Crash logging so Cloud Run shows real reasons
-process.on("uncaughtException", (e) =>
-  console.error("UNCAUGHT_EXCEPTION", e)
-);
-process.on("unhandledRejection", (e) =>
-  console.error("UNHANDLED_REJECTION", e)
-);
+process.on("uncaughtException", (e) => console.error("UNCAUGHT_EXCEPTION", e));
+process.on("unhandledRejection", (e) => console.error("UNHANDLED_REJECTION", e));
 
 // -----------------------------------------------------------------------------
 // EXPRESS APP (health + static frontend)
@@ -63,29 +68,24 @@ app.get("/voice", (req, res) => {
 // Calendar helpers + endpoint
 // -----------------------------------------------------------------------------
 function extractMeetingLink(ev) {
-  // Older field for Google Meet
   if (ev.hangoutLink) return ev.hangoutLink;
 
   const conf = ev.conferenceData;
   if (!conf) return null;
 
-  // Prefer "video" entry point (Google Meet / Zoom / etc.)
   if (Array.isArray(conf.entryPoints)) {
     const videoEntry = conf.entryPoints.find(
       (ep) => ep.entryPointType === "video" && ep.uri
     );
     if (videoEntry) return videoEntry.uri;
   }
-
   return null;
 }
 
-// Calendar events: upcoming events for a student on a given course calendar
 app.get("/calendar-events", async (req, res) => {
   try {
     const { email, calendarId } = req.query;
 
-    // simple API key protection
     if (req.headers["x-api-key"] !== process.env.MY_LMS_API_KEY) {
       return res.status(401).json({ error: "Unauthorized" });
     }
@@ -98,16 +98,15 @@ app.get("/calendar-events", async (req, res) => {
 
     const studentEmail = normalizeEmail(email);
 
-    // This already filters to upcoming events (timeMin = now) inside the helper
     const events = await getEventsForStudent(calendarId, studentEmail);
 
     const formatted = events.map((ev) => ({
       id: ev.id,
       summary: ev.summary || "",
       description: ev.description || "",
-      start: ev.start, // { dateTime, timeZone } OR { date }
+      start: ev.start,
       end: ev.end,
-      htmlLink: ev.htmlLink || "", // open in Google Calendar
+      htmlLink: ev.htmlLink || "",
       location: ev.location || "",
       meetingLink: extractMeetingLink(ev) || "",
       isAllDay: !!ev.start?.date && !ev.start?.dateTime,
@@ -139,7 +138,6 @@ const withTimeout = async (promise, ms, msg = "Timed out") => {
   return Promise.race([promise, timeout]);
 };
 
-// Synonyms expanded like in index.js
 const addSynonyms = (phrase, bag) => {
   const raw = String(phrase || "");
   const display = raw.trim();
@@ -290,12 +288,9 @@ async function getStudentScope(email) {
   const url = `${PLURALCODE_API_BASE}/student/praxis_get_student_courses?email=${encodeURIComponent(
     clean
   )}`;
+
   try {
-    const response = await withTimeout(
-      fetch(url),
-      8000,
-      "Pluralcode API timeout"
-    );
+    const response = await withTimeout(fetch(url), 8000, "Pluralcode API timeout");
     if (!response.ok)
       throw new Error(`Pluralcode API failed with status ${response.status}`);
     const data = await response.json();
@@ -330,18 +325,15 @@ Enrolled Course(s): "${enrolledCourseNames}"
 - When you recommend external resources, include full URLs in the text so the UI can show previews. In voice, do NOT spell out the URL; just refer to it naturally.`;
 }
 
-// Detect when the student's latest message is clearly asking for a quiz/test
 function isQuizRequest(text) {
   if (!text) return false;
   const t = text.toLowerCase();
-
   if (t.includes("quiz")) return true;
   if (t.includes("test me")) return true;
   if (t.includes("practice questions")) return true;
   if (t.includes("practice test")) return true;
   if (t.includes("mcq")) return true;
   if (t.includes("multiple choice") && t.includes("question")) return true;
-
   return false;
 }
 
@@ -377,10 +369,7 @@ const validateUrl = async (url) => {
   } catch (_) {
     try {
       const res2 = await withTimeout(
-        fetch(url, {
-          method: "GET",
-          headers: { Range: "bytes=0-1024" },
-        }),
+        fetch(url, { method: "GET", headers: { Range: "bytes=0-1024" } }),
         4500,
         "URL GET timeout"
       );
@@ -454,24 +443,179 @@ async function search_web_for_articles({ query }) {
 }
 
 // -----------------------------------------------------------------------------
-// Gemini text API - FIXED VERSION (Using Official SDK like working codebase)
+// Gemini — DROP-IN FIX (NO GEMINI_MODEL GLOBAL USED ANYWHERE)
 // -----------------------------------------------------------------------------
-const { GoogleGenerativeAI } = require("@google/generative-ai");
+let _aiClientPromise = null;
+let _activeModel = null;
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-if (!GEMINI_API_KEY) {
-  console.warn("⚠️ GEMINI_API_KEY not set in environment!");
+const GEMINI_API_VERSION = process.env.GEMINI_API_VERSION || "v1";
+
+const ENV_MODEL_RAW = (process.env.GEMINI_MODEL || "").trim();
+const MODEL_FALLBACKS = [
+  ...(ENV_MODEL_RAW ? [ENV_MODEL_RAW] : []),
+  "gemini-2.5-pro",
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-3-flash-preview", // last resort
+];
+
+function normalizeModelName(m) {
+  return String(m || "").trim().replace(/^models\//, "");
 }
 
-// Use the official SDK (same as working codebase)
-const genAI = new GoogleGenerativeAI(GEMINI_API_KEY, { apiVersion: 'v1' });
+function getCurrentModelLabel() {
+  return _activeModel ? _activeModel : "(resolving)";
+}
 
-// Model name (without "models/" prefix - SDK handles it)
-const RAW_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-pro"; // Use same as working codebase
-const GEMINI_MODEL = RAW_MODEL.replace(/^models\//, ""); // Remove models/ prefix if present
+async function getGeminiClient() {
+  if (_aiClientPromise) return _aiClientPromise;
 
-console.log(`📌 Using Gemini model: ${GEMINI_MODEL}`);
+  _aiClientPromise = (async () => {
+    if (!GEMINI_API_KEY || !String(GEMINI_API_KEY).trim()) {
+      throw new Error("GEMINI_API_KEY is missing or empty.");
+    }
 
+    // ESM-first package, but this file is CommonJS: dynamic import works.
+    const mod = await import("@google/genai");
+    const GoogleGenAI = mod.GoogleGenAI;
+
+    const ai = new GoogleGenAI({
+      apiKey: GEMINI_API_KEY,
+      httpOptions: { apiVersion: GEMINI_API_VERSION },
+    });
+
+    console.log(`✅ Gemini client ready (apiVersion=${GEMINI_API_VERSION})`);
+    return ai;
+  })();
+
+  return _aiClientPromise;
+}
+
+async function modelWorks(ai, model) {
+  const modelId = normalizeModelName(model);
+  try {
+    await ai.models.get({ model: modelId });
+
+    const probe = await ai.models.generateContent({
+      model: modelId,
+      contents: "ping",
+      config: { maxOutputTokens: 4, temperature: 0, candidateCount: 1 },
+    });
+
+    const t = probe?.text ? String(probe.text).trim() : "";
+    return t.length > 0;
+  } catch (e) {
+    const msg = e?.message || String(e);
+    console.warn(`⚠️ Model probe failed for "${modelId}": ${msg}`);
+    return false;
+  }
+}
+
+async function resolveActiveModel() {
+  if (_activeModel) return _activeModel;
+
+  const ai = await getGeminiClient();
+  for (const candidate of MODEL_FALLBACKS) {
+    const id = normalizeModelName(candidate);
+    if (await modelWorks(ai, id)) {
+      _activeModel = id;
+      console.log(`📌 Using Gemini model: ${_activeModel}`);
+      return _activeModel;
+    }
+  }
+
+  throw new Error(
+    `No working Gemini model found. Tried: ${MODEL_FALLBACKS.map(normalizeModelName).join(
+      ", "
+    )}`
+  );
+}
+
+function clampContents(contents, maxItems = 24) {
+  if (!Array.isArray(contents)) return contents;
+  if (contents.length <= maxItems) return contents;
+  return contents.slice(contents.length - maxItems);
+}
+
+function extractTextOrFallback(resp) {
+  const t = resp?.text ? String(resp.text).trim() : "";
+  if (t) return { text: t, blocked: false };
+
+  const parts = resp?.candidates?.[0]?.content?.parts || [];
+  const joined = parts.map((p) => p?.text || "").join("").trim();
+  if (joined) return { text: joined, blocked: false };
+
+  const finishReason = resp?.candidates?.[0]?.finishReason || null;
+  const blockReason = resp?.promptFeedback?.blockReason || null;
+
+  return {
+    text:
+      "I couldn’t generate a response for that. Please rephrase your question in a simpler way.",
+    blocked: true,
+    meta: { finishReason, blockReason },
+  };
+}
+
+/**
+ * Call Gemini via @google/genai generateContent
+ * contents: [{ role: "user"|"model", parts:[{ text }] }, ...]
+ */
+async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
+  const ai = await getGeminiClient();
+  const model = await resolveActiveModel();
+  const safeContents = clampContents(contents, 24);
+
+  try {
+    const resp = await ai.models.generateContent({
+      model,
+      contents: safeContents,
+      config: {
+        systemInstruction: systemInstruction || "",
+        temperature: 0.4,
+        candidateCount: 1,
+        maxOutputTokens: maxTokens || 512,
+      },
+    });
+
+    const extracted = extractTextOrFallback(resp);
+    if (extracted.blocked) {
+      console.warn("[Gemini] Empty/blocked response meta:", extracted.meta || {});
+    }
+    return extracted.text;
+  } catch (err) {
+    const msg = err?.message || String(err);
+    console.error("Gemini generateContent failed:", msg);
+
+    // If model got retired / 404’d mid-flight: reset and retry once.
+    if (/404|not found|Model/i.test(msg)) {
+      _activeModel = null;
+      const retryModel = await resolveActiveModel();
+
+      const resp2 = await ai.models.generateContent({
+        model: retryModel,
+        contents: safeContents,
+        config: {
+          systemInstruction: systemInstruction || "",
+          temperature: 0.4,
+          candidateCount: 1,
+          maxOutputTokens: maxTokens || 512,
+        },
+      });
+
+      return extractTextOrFallback(resp2).text;
+    }
+
+    throw new Error(`Gemini API error: ${msg}`);
+  }
+}
+
+// Warmup (non-blocking)
+resolveActiveModel().catch((e) => console.warn("Gemini warmup failed:", e.message || e));
+
+// -----------------------------------------------------------------------------
+// System instructions
+// -----------------------------------------------------------------------------
 const BASE_SYSTEM_INSTRUCTION = `
 You are Praxis, a specialized MALE AI tutor for Pluralcode Academy students.
 
@@ -495,11 +639,6 @@ LINKS & RESOURCES
 - Whenever you share specific resources, also append one JSON line per resource at the END of your reply in one of these formats:
   VIDEO: {"title":"...","url":"https://...","description":"...","platform":"youtube"}
   ARTICLE: {"title":"...","url":"https://...","description":"...","source":"article"}
-- For these JSON objects:
-  - "title" is a short human-readable title.
-  - "url" is the full link to the video or article.
-  - "description" is a short 1–2 sentence description.
-  - "platform"/"source" are short identifiers like "youtube", "docs", "blog".
 - Do NOT put curly braces { or } inside any of the string fields in these JSON objects.
 - If the student explicitly asks for videos or articles, you MUST include at least 3 structured VIDEO or ARTICLE lines (if such resources exist).
 - In voice, do NOT read out the full URL; just say something like: "I'm sharing a link in your resources panel."
@@ -525,318 +664,41 @@ For THIS reply you must:
 - You may include at most ONE short introductory sentence before the QUIZ lines.
 `;
 
-/**
- * FIXED: Call Gemini using Official SDK (same approach as working codebase)
- * contents: [{ role: "user"|"model", parts:[{ text }] }, ...]
- * maxTokens: optional override for maxOutputTokens
- */
-/**
- * Call Gemini using Official SDK - Optimized for Voice Interactions
- * Returns text that will be converted to speech via TTS
- * contents: [{ role: "user"|"model", parts:[{ text }] }, ...]
- * maxTokens: optional override for maxOutputTokens
- */
-async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
-  if (!GEMINI_API_KEY) {
-    throw new Error("GEMINI_API_KEY is missing.");
-  }
-
-  // Validate API key format (should be non-empty string)
-  if (typeof GEMINI_API_KEY !== 'string' || GEMINI_API_KEY.trim() === '') {
-    throw new Error("GEMINI_API_KEY is invalid or empty.");
-  }
-
-  try {
-    // Convert contents to SDK format (preserve conversation history for voice continuity)
-    const history = contents.slice(0, -1).map(c => ({
-      role: c.role === "model" ? "model" : "user",
-      parts: c.parts
-    }));
-
-    // Get the current user message (from voice input)
-    const lastMessage = contents[contents.length - 1];
-    const currentUserMessage = lastMessage?.parts?.[0]?.text || "";
-
-    if (!currentUserMessage || currentUserMessage.trim() === "") {
-      throw new Error("User message is empty");
-    }
-
-    console.log(`[Gemini] Calling model: ${GEMINI_MODEL}, message length: ${currentUserMessage.length}, history length: ${history.length}`);
-
-    // Configure model with system instruction (SDK handles this properly)
-    const modelConfig = {
-      model: GEMINI_MODEL,
-      systemInstruction: systemInstruction, // SDK supports this directly - no prepending needed
-      generationConfig: {
-        temperature: 0.4,
-        maxOutputTokens: maxTokens || 512,
-      },
-    };
-
-    // Get model and start chat with history (important for voice conversation continuity)
-    const model = genAI.getGenerativeModel(modelConfig);
-    
-    // If no history, use generateContent instead of startChat (simpler for first message)
-    let text = "";
-    let response = null; // Declare response in outer scope
-    
-    if (history.length === 0) {
-      console.log(`[Gemini] No history - using generateContent for ${GEMINI_MODEL}...`);
-      console.log(`[Gemini] Message: "${currentUserMessage.substring(0, 100)}..."`);
-      
-      const result = await model.generateContent(currentUserMessage);
-      response = await result.response;
-      
-      try {
-        text = response.text();
-        console.log(`[Gemini] Got text via generateContent, length: ${text?.length || 0}`);
-      } catch (textError) {
-        console.error("[Gemini] Error calling response.text() in generateContent:", textError);
-        const parts = response?.candidates?.[0]?.content?.parts || [];
-        text = parts.map(p => p.text || "").join(" ");
-      }
-    } else {
-      // Use chat for conversation continuity
-      const chat = model.startChat({ history });
-      console.log(`[Gemini] Using chat with history (${history.length} messages) for ${GEMINI_MODEL}...`);
-      console.log(`[Gemini] Message: "${currentUserMessage.substring(0, 100)}..."`);
-      
-      const result = await chat.sendMessage(currentUserMessage);
-      response = await result.response;
-    
-      // Debug: Log full response structure - capture everything
-      const responseDebug = {
-        hasResponse: !!response,
-        responseType: typeof response,
-        responseKeys: response ? Object.keys(response) : [],
-        candidates: response?.candidates?.length || 0,
-        finishReason: response?.candidates?.[0]?.finishReason,
-        parts: response?.candidates?.[0]?.content?.parts?.length || 0,
-        hasTextMethod: typeof response?.text === 'function',
-        fullResponseString: JSON.stringify(response, null, 2).substring(0, 1000) // First 1000 chars
-      };
-      console.log(`[Gemini] Full response debug:`, JSON.stringify(responseDebug, null, 2));
-      
-      // Get text from response - handle different response formats
-      try {
-        // Primary method: use response.text()
-        if (typeof response.text === 'function') {
-          text = response.text();
-          console.log(`[Gemini] Got text via response.text(), length: ${text?.length || 0}, preview: "${text?.substring(0, 50)}..."`);
-        } else {
-          console.warn(`[Gemini] response.text is not a function, trying alternative extraction`);
-          // Fallback: extract from parts directly
-          const candidates = response?.candidates || [];
-          if (candidates.length > 0) {
-            const parts = candidates[0]?.content?.parts || [];
-            for (const part of parts) {
-              if (part.text) {
-                text += part.text;
-              }
-            }
-            console.log(`[Gemini] Got text via parts extraction, length: ${text?.length || 0}`);
-          }
-        }
-      } catch (textError) {
-        console.error("[Gemini] Error calling response.text():", textError);
-        // Fallback: extract from parts directly
-        const candidates = response?.candidates || [];
-        if (candidates.length > 0) {
-          const parts = candidates[0]?.content?.parts || [];
-          for (const part of parts) {
-            if (part.text) {
-              text += part.text;
-            }
-          }
-          console.log(`[Gemini] Got text via parts extraction (after error), length: ${text?.length || 0}`);
-        }
-      }
-    }
-    
-    // If still no text, check for blocked content or errors
-    if (!text || text.trim() === "") {
-      const finishReason = response?.candidates?.[0]?.finishReason;
-      const safetyRatings = response?.candidates?.[0]?.safetyRatings || [];
-      const responseDetails = {
-        finishReason,
-        safetyRatings: safetyRatings.map(r => ({ 
-          category: r.category, 
-          probability: r.probability 
-        })),
-        hasCandidates: !!response?.candidates?.length,
-        candidateCount: response?.candidates?.length || 0,
-        model: GEMINI_MODEL,
-        fullResponse: JSON.stringify(response, null, 2).substring(0, 1000), // First 1000 chars for debugging
-        responseKeys: response ? Object.keys(response) : [],
-        hasTextMethod: typeof response?.text === 'function',
-        candidatesStructure: response?.candidates?.[0] ? Object.keys(response.candidates[0]) : []
-      };
-      
-      console.error("[Gemini] Empty response details:", JSON.stringify(responseDetails, null, 2));
-      
-      // Create error with details to throw to frontend
-      const emptyResponseError = new Error("Empty response from Gemini API");
-      emptyResponseError.responseDetails = responseDetails;
-      emptyResponseError.finishReason = finishReason;
-      emptyResponseError.safetyRatings = safetyRatings;
-      throw emptyResponseError;
-    }
-
-    // Return text for TTS synthesis (voice output)
-    return text.trim();
-  } catch (error) {
-    console.error("Gemini API call failed:", {
-      error: error.message,
-      stack: error.stack,
-      model: GEMINI_MODEL
-    });
-
-    // Try fallback models if primary fails (important for voice reliability)
-    const fallbackModels = [
-      "gemini-2.5-pro",
-      "gemini-1.5-pro",
-      "gemini-1.5-flash",
-      "gemini-pro"
-    ].filter(m => m !== GEMINI_MODEL);
-
-    for (const fallbackModel of fallbackModels) {
-      try {
-        console.log(`[Voice] Trying fallback model: ${fallbackModel}`);
-        
-        const history = contents.slice(0, -1).map(c => ({
-          role: c.role === "model" ? "model" : "user",
-          parts: c.parts
-        }));
-
-        const lastMessage = contents[contents.length - 1];
-        const currentUserMessage = lastMessage?.parts?.[0]?.text || "";
-
-        const modelConfig = {
-          model: fallbackModel,
-          systemInstruction: systemInstruction,
-          generationConfig: {
-            temperature: 0.4,
-            maxOutputTokens: maxTokens || 512,
-          },
-        };
-
-        const model = genAI.getGenerativeModel(modelConfig);
-        const chat = model.startChat({ history });
-        const result = await chat.sendMessage(currentUserMessage);
-        const response = await result.response;
-        
-        let text = "";
-        try {
-          text = response.text();
-        } catch (textError) {
-          const parts = response?.candidates?.[0]?.content?.parts || [];
-          if (parts.length > 0 && parts[0].text) {
-            text = parts[0].text;
-          }
-        }
-        
-        if (!text || text.trim() === "") {
-          const finishReason = response?.candidates?.[0]?.finishReason;
-          const safetyRatings = response?.candidates?.[0]?.safetyRatings || [];
-          console.error(`[Voice] Fallback model ${fallbackModel} returned empty - finishReason:`, finishReason);
-          
-          // If this is the last fallback, throw error with details
-          if (fallbackModel === fallbackModels[fallbackModels.length - 1]) {
-            const emptyResponseError = new Error("All models returned empty response");
-            emptyResponseError.responseDetails = {
-              finishReason,
-              safetyRatings: safetyRatings.map(r => ({ 
-                category: r.category, 
-                probability: r.probability 
-              })),
-              modelsTried: [GEMINI_MODEL, ...fallbackModels],
-              lastModel: fallbackModel
-            };
-            emptyResponseError.finishReason = finishReason;
-            emptyResponseError.safetyRatings = safetyRatings;
-            throw emptyResponseError;
-          }
-          continue;
-        }
-
-        console.log(`✅ [Voice] Success with fallback model: ${fallbackModel}`);
-        return text.trim();
-      } catch (fallbackError) {
-        console.error(`[Voice] Fallback model ${fallbackModel} also failed:`, fallbackError.message);
-        continue;
-      }
-    }
-
-    // Enhance error with all details for frontend
-    const enhancedError = new Error(
-      `Gemini API error: ${error.message}. Tried fallbacks: ${fallbackModels.join(", ")}`
-    );
-    enhancedError.responseDetails = {
-      originalError: error.message,
-      modelsTried: [GEMINI_MODEL, ...fallbackModels],
-      model: GEMINI_MODEL,
-      ...(error.responseDetails && { lastResponseDetails: error.responseDetails }),
-      ...(error.finishReason && { lastFinishReason: error.finishReason }),
-      ...(error.safetyRatings && { lastSafetyRatings: error.safetyRatings })
-    };
-    enhancedError.originalError = error;
-    enhancedError.finishReason = error.finishReason;
-    enhancedError.safetyRatings = error.safetyRatings;
-    throw enhancedError;
-  }
-}
-
 // -----------------------------------------------------------------------------
-// TEST ENDPOINT - Verify API key and model using SDK
+// TEST ENDPOINT - Verify Gemini API using current SDK
 // -----------------------------------------------------------------------------
 app.get("/test-gemini", async (req, res) => {
   try {
-    if (!GEMINI_API_KEY) {
+    if (!process.env.GEMINI_API_KEY) {
       return res.status(500).json({ error: "GEMINI_API_KEY not set" });
     }
 
-    console.log(`Testing Gemini API with model: ${GEMINI_MODEL}`);
+    const ai = await getGeminiClient();
+    const model = await resolveActiveModel();
 
-    const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
-    const result = await model.generateContent("Say hello in one word");
-    const response = await result.response;
-    
-    // Log full response structure
-    console.log("Test response structure:", {
-      hasResponse: !!response,
-      hasTextMethod: typeof response.text === 'function',
-      candidates: response?.candidates?.length || 0,
-      finishReason: response?.candidates?.[0]?.finishReason
+    const resp = await ai.models.generateContent({
+      model,
+      contents: "Say hello in one word",
+      config: { maxOutputTokens: 16, temperature: 0, candidateCount: 1 },
     });
-    
-    let text = "";
-    try {
-      text = response.text();
-    } catch (e) {
-      // Try extracting from parts
-      const parts = response?.candidates?.[0]?.content?.parts || [];
-      text = parts.map(p => p.text).join(" ");
-    }
+
+    const extracted = extractTextOrFallback(resp);
 
     res.json({
-      success: !!text,
-      model: GEMINI_MODEL,
-      response: text || "(empty)",
-      responseStructure: {
-        hasResponse: !!response,
-        hasTextMethod: typeof response.text === 'function',
-        candidates: response?.candidates?.length || 0,
-        finishReason: response?.candidates?.[0]?.finishReason,
-        safetyRatings: response?.candidates?.[0]?.safetyRatings || []
-      },
-      note: "Using @google/generative-ai SDK"
+      success: true,
+      model,
+      apiVersion: GEMINI_API_VERSION,
+      response: extracted.text,
+      blocked: !!extracted.blocked,
+      meta: extracted.meta || null,
+      note: "Using @google/genai",
     });
   } catch (error) {
-    res.status(500).json({ 
+    res.status(500).json({
       error: error.message,
-      stack: error.stack,
-      model: GEMINI_MODEL,
-      note: "Make sure @google/generative-ai package is installed: npm install @google/generative-ai"
+      model: getCurrentModelLabel(),
+      apiVersion: GEMINI_API_VERSION,
+      note: "Make sure @google/genai is installed: npm install @google/genai",
     });
   }
 });
@@ -844,11 +706,9 @@ app.get("/test-gemini", async (req, res) => {
 // -----------------------------------------------------------------------------
 // GOOGLE TTS — sanitize + synthesize (no URLs or weird characters)
 // -----------------------------------------------------------------------------
-
 function sanitizeForSpeech(text) {
   if (!text) return "";
 
-  // 1) Remove any full lines that start with QUIZ:, VIDEO:, or ARTICLE:
   let t = text
     .split(/\r?\n/)
     .filter((line) => {
@@ -860,44 +720,27 @@ function sanitizeForSpeech(text) {
     })
     .join(" ");
 
-  // 2) Extra safety: strip any inline QUIZ: {...}, VIDEO: {...}, ARTICLE: {...}
   t = t.replace(/QUIZ:\s*{[^}]*}/gi, " ");
   t = t.replace(/VIDEO:\s*{[^}]*}/gi, " ");
   t = t.replace(/ARTICLE:\s*{[^}]*}/gi, " ");
 
-  // 3) Cut off sections starting with "Links:" or "Resources:"
   const cutIdx = t.search(/(links:|resources:)/i);
-  if (cutIdx !== -1) {
-    t = t.slice(0, cutIdx);
-  }
+  if (cutIdx !== -1) t = t.slice(0, cutIdx);
 
-  // 4) Remove explicit URLs (http/https)
   t = t.replace(/https?:\/\/\S+/gi, " ");
-
-  // 5) Remove bare domains like example.com/path
   t = t.replace(
     /\b[^\s]+\.(com|net|org|io|ai|edu|co|dev|info)(\/[^\s]*)?/gi,
     " "
   );
-
-  // 6) Remove "www." style hosts
   t = t.replace(/\bwww\.[^\s]+/gi, " ");
 
-  // 7) Remove inline code and markdown-ish symbols
   t = t.replace(/`[^`]*`/g, " ");
   t = t.replace(/[*_>#\-]+/g, " ");
   t = t.replace(/[•~_=^]+/g, " ");
-
-  // 8) Remove brackets, slashes, pipes
   t = t.replace(/[\[\]\(\)\{\}<>\/\\|]+/g, " ");
-
-  // 9) Collapse extra punctuation
   t = t.replace(/[;:]{2,}/g, " ");
 
-  // 10) Fix some pronunciations
   t = t.replace(/\bExcel\b/gi, "Microsoft Excel");
-
-  // 11) Collapse extra whitespace
   t = t.replace(/\s{2,}/g, " ");
 
   return t.trim();
@@ -910,10 +753,8 @@ async function synthesizeWithGoogleTTS(fullText) {
   const request = {
     input: { text: spoken },
     voice: {
-      // Use British English as closest to Nigerian accent in Google TTS right now
       languageCode: "en-GB",
       ssmlGender: "MALE",
-      // No "name" field, let Google pick default en-GB male
     },
     audioConfig: {
       audioEncoding: "MP3",
@@ -924,10 +765,7 @@ async function synthesizeWithGoogleTTS(fullText) {
   const [response] = await ttsClient.synthesizeSpeech(request);
   if (!response.audioContent) return null;
   const audioBase64 = response.audioContent.toString("base64");
-  return {
-    audioBase64,
-    mimeType: "audio/mpeg",
-  };
+  return { audioBase64, mimeType: "audio/mpeg" };
 }
 
 // -----------------------------------------------------------------------------
@@ -966,17 +804,11 @@ app.post("/api/chat", async (req, res) => {
         if (!h || !h.text) continue;
         let role = "user";
         if (h.role === "assistant" || h.role === "model") role = "model";
-        contents.push({
-          role,
-          parts: [{ text: h.text }],
-        });
+        contents.push({ role, parts: [{ text: h.text }] });
       }
     }
 
-    contents.push({
-      role: "user",
-      parts: [{ text: message }],
-    });
+    contents.push({ role: "user", parts: [{ text: message }] });
 
     const quizMode = isQuizRequest(message);
     const finalInstruction = quizMode
@@ -989,10 +821,13 @@ app.post("/api/chat", async (req, res) => {
       maxTokens: quizMode ? 2048 : 512,
     });
 
-    return res.json({ text: aiText });
+    return res.json({ text: aiText, model: getCurrentModelLabel() });
   } catch (err) {
     console.error("❌ /api/chat error:", err);
-    return res.status(500).json({ error: err.message || "Server error" });
+    return res.status(500).json({
+      error: err.message || "Server error",
+      model: getCurrentModelLabel(),
+    });
   }
 });
 
@@ -1008,7 +843,6 @@ wss.on("connection", (ws) => {
 
   console.log("WS client connected:", ws.id);
 
-  // Keep WebSocket alive with periodic ping frames
   const pingInterval = setInterval(() => {
     if (ws.readyState === WebSocket.OPEN) {
       try {
@@ -1039,9 +873,7 @@ wss.on("connection", (ws) => {
     if (msg.type === "start") {
       try {
         if (msg.lmsKey && msg.lmsKey !== process.env.MY_LMS_API_KEY) {
-          ws.send(
-            JSON.stringify({ type: "error", error: "Invalid LMS key." })
-          );
+          ws.send(JSON.stringify({ type: "error", error: "Invalid LMS key." }));
           ws.close();
           return;
         }
@@ -1058,7 +890,6 @@ wss.on("connection", (ws) => {
         );
         const systemInstruction = `${BASE_SYSTEM_INSTRUCTION}\n\n${header}`;
 
-        // seed history from client (for reconnect)
         const initialHistory = Array.isArray(msg.history)
           ? msg.history.filter(
               (h) =>
@@ -1105,7 +936,6 @@ wss.on("connection", (ws) => {
       if (!text) return;
 
       const requestId = msg.requestId || crypto.randomUUID();
-
       ws.session.history.push({ role: "user", text });
 
       const contents = ws.session.history.map((h) => ({
@@ -1119,22 +949,21 @@ wss.on("connection", (ws) => {
         : ws.session.systemInstruction;
 
       try {
-        // Log WebSocket request for debugging
-        console.log(`[WS ${ws.id}] Calling Gemini API for user: ${ws.session.studentEmail}`);
-        console.log(`[WS ${ws.id}] User message: "${text.substring(0, 100)}..."`);
-        console.log(`[WS ${ws.id}] Contents length: ${contents.length}`);
-        
+        console.log(
+          `[WS ${ws.id}] Gemini call | model=${getCurrentModelLabel()} | user=${ws.session.studentEmail} | msg="${text.substring(
+            0,
+            100
+          )}..."`
+        );
+
         const aiText = await callGeminiChat({
           systemInstruction: finalInstruction,
           contents,
           maxTokens: quizMode ? 2048 : 512,
         });
 
-        console.log(`[WS ${ws.id}] Gemini API success, response length: ${aiText.length}`);
-        console.log(`[WS ${ws.id}] Response preview: "${aiText.substring(0, 100)}..."`);
         ws.session.history.push({ role: "assistant", text: aiText });
 
-        // Voice interaction: Convert AI text response to speech
         let tts = null;
         try {
           tts = await synthesizeWithGoogleTTS(aiText);
@@ -1142,49 +971,32 @@ wss.on("connection", (ws) => {
           console.error("[Voice] Google TTS error:", ttsErr);
         }
 
-        // Send both text (for display) and audio (for voice playback)
         const payload = {
           type: "assistant_text",
-          text: aiText, // Text for UI display
+          text: aiText,
           requestId,
+          model: getCurrentModelLabel(),
         };
         if (tts && tts.audioBase64) {
-          payload.audio = tts.audioBase64; // Audio for voice playback
+          payload.audio = tts.audioBase64;
           payload.audioMime = tts.mimeType;
         }
 
         ws.send(JSON.stringify(payload));
       } catch (err) {
-        console.error(`[WS ${ws.id}] Gemini API error:`, {
-          error: err.message,
-          stack: err.stack,
-          model: GEMINI_MODEL,
-          studentEmail: ws.session?.studentEmail
-        });
-        
-        // Send detailed error to frontend for debugging
+        console.error(`[WS ${ws.id}] Gemini error:`, err);
+
         const errorPayload = {
           type: "error",
           error: err.message || "Gemini error",
           details: {
-            model: GEMINI_MODEL,
-            message: err.message,
-            ...(err.responseDetails && { responseDetails: err.responseDetails }),
-            ...(err.finishReason && { finishReason: err.finishReason }),
-            ...(err.safetyRatings && { 
-              safetyRatings: Array.isArray(err.safetyRatings) 
-                ? err.safetyRatings.map(r => ({ 
-                    category: r.category, 
-                    probability: r.probability 
-                  }))
-                : err.safetyRatings
-            }),
-            ...(err.originalError && { originalError: err.originalError.message }),
-            ...(process.env.NODE_ENV === "development" && { stack: err.stack })
-          }
+            model: getCurrentModelLabel(),
+            studentEmail: ws.session?.studentEmail,
+            apiVersion: GEMINI_API_VERSION,
+            ...(process.env.NODE_ENV === "development" && { stack: err.stack }),
+          },
         };
-        
-        console.log(`[WS ${ws.id}] Sending error to frontend:`, JSON.stringify(errorPayload, null, 2));
+
         ws.send(JSON.stringify(errorPayload));
       }
       return;
@@ -1212,9 +1024,15 @@ wss.on("connection", (ws) => {
 // HTTP server
 // -----------------------------------------------------------------------------
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, "0.0.0.0", () =>
-  console.log(
-    `🚀 Praxis Voice (Gemini+TTS+WS) listening on ${PORT}, model=${GEMINI_MODEL}`
-  )
-);
+server.listen(PORT, "0.0.0.0", () => {
+  console.log(`🚀 Praxis Voice listening on ${PORT} | model=${getCurrentModelLabel()} | apiVersion=${GEMINI_API_VERSION}`);
 
+  // Once resolved, print the real model
+  resolveActiveModel()
+    .then((m) =>
+      console.log(`✅ Gemini model resolved and active: ${m}`)
+    )
+    .catch((e) =>
+      console.warn(`⚠️ Gemini model resolve failed after listen: ${e.message || e}`)
+    );
+});
