@@ -541,6 +541,11 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
     throw new Error("GEMINI_API_KEY is missing.");
   }
 
+  // Validate API key format (should be non-empty string)
+  if (typeof GEMINI_API_KEY !== 'string' || GEMINI_API_KEY.trim() === '') {
+    throw new Error("GEMINI_API_KEY is invalid or empty.");
+  }
+
   try {
     // Convert contents to SDK format (preserve conversation history for voice continuity)
     const history = contents.slice(0, -1).map(c => ({
@@ -551,6 +556,12 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
     // Get the current user message (from voice input)
     const lastMessage = contents[contents.length - 1];
     const currentUserMessage = lastMessage?.parts?.[0]?.text || "";
+
+    if (!currentUserMessage || currentUserMessage.trim() === "") {
+      throw new Error("User message is empty");
+    }
+
+    console.log(`[Gemini] Calling model: ${GEMINI_MODEL}, message length: ${currentUserMessage.length}, history length: ${history.length}`);
 
     // Configure model with system instruction (SDK handles this properly)
     const modelConfig = {
@@ -567,23 +578,42 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
     const chat = model.startChat({ history });
 
     // Send current user message (from voice input)
+    console.log(`[Gemini] Sending message to ${GEMINI_MODEL}...`);
     const result = await chat.sendMessage(currentUserMessage);
     const response = await result.response;
     
-    // Debug: Log response structure
-    console.log(`[Gemini] Response structure:`, {
+    // Debug: Log full response structure
+    console.log(`[Gemini] Full response object:`, JSON.stringify({
       hasResponse: !!response,
+      responseType: typeof response,
+      responseKeys: response ? Object.keys(response) : [],
       candidates: response?.candidates?.length || 0,
       finishReason: response?.candidates?.[0]?.finishReason,
-      parts: response?.candidates?.[0]?.content?.parts?.length || 0
-    });
+      parts: response?.candidates?.[0]?.content?.parts?.length || 0,
+      hasTextMethod: typeof response?.text === 'function'
+    }, null, 2));
     
     // Get text from response - handle different response formats
     let text = "";
     try {
       // Primary method: use response.text()
-      text = response.text();
-      console.log(`[Gemini] Got text via response.text(), length: ${text?.length || 0}`);
+      if (typeof response.text === 'function') {
+        text = response.text();
+        console.log(`[Gemini] Got text via response.text(), length: ${text?.length || 0}, preview: "${text?.substring(0, 50)}..."`);
+      } else {
+        console.warn(`[Gemini] response.text is not a function, trying alternative extraction`);
+        // Fallback: extract from parts directly
+        const candidates = response?.candidates || [];
+        if (candidates.length > 0) {
+          const parts = candidates[0]?.content?.parts || [];
+          for (const part of parts) {
+            if (part.text) {
+              text += part.text;
+            }
+          }
+          console.log(`[Gemini] Got text via parts extraction, length: ${text?.length || 0}`);
+        }
+      }
     } catch (textError) {
       console.error("[Gemini] Error calling response.text():", textError);
       // Fallback: extract from parts directly
@@ -595,7 +625,7 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
             text += part.text;
           }
         }
-        console.log(`[Gemini] Got text via parts extraction, length: ${text?.length || 0}`);
+        console.log(`[Gemini] Got text via parts extraction (after error), length: ${text?.length || 0}`);
       }
     }
     
@@ -611,10 +641,11 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
         })),
         hasCandidates: !!response?.candidates?.length,
         candidateCount: response?.candidates?.length || 0,
-        model: GEMINI_MODEL
+        model: GEMINI_MODEL,
+        fullResponse: JSON.stringify(response, null, 2).substring(0, 500) // First 500 chars for debugging
       };
       
-      console.error("[Gemini] Empty response details:", responseDetails);
+      console.error("[Gemini] Empty response details:", JSON.stringify(responseDetails, null, 2));
       
       // Create error with details to throw to frontend
       const emptyResponseError = new Error("Empty response from Gemini API");
@@ -625,9 +656,6 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
     }
 
     // Return text for TTS synthesis (voice output)
-    if (!text || text.trim() === "") {
-      throw new Error("Received empty response from Gemini API");
-    }
     return text.trim();
   } catch (error) {
     console.error("Gemini API call failed:", {
@@ -712,9 +740,22 @@ async function callGeminiChat({ systemInstruction, contents, maxTokens }) {
       }
     }
 
-    throw new Error(
+    // Enhance error with all details for frontend
+    const enhancedError = new Error(
       `Gemini API error: ${error.message}. Tried fallbacks: ${fallbackModels.join(", ")}`
     );
+    enhancedError.responseDetails = {
+      originalError: error.message,
+      modelsTried: [GEMINI_MODEL, ...fallbackModels],
+      model: GEMINI_MODEL,
+      ...(error.responseDetails && { lastResponseDetails: error.responseDetails }),
+      ...(error.finishReason && { lastFinishReason: error.finishReason }),
+      ...(error.safetyRatings && { lastSafetyRatings: error.safetyRatings })
+    };
+    enhancedError.originalError = error;
+    enhancedError.finishReason = error.finishReason;
+    enhancedError.safetyRatings = error.safetyRatings;
+    throw enhancedError;
   }
 }
 
@@ -732,17 +773,41 @@ app.get("/test-gemini", async (req, res) => {
     const model = genAI.getGenerativeModel({ model: GEMINI_MODEL });
     const result = await model.generateContent("Say hello in one word");
     const response = await result.response;
-    const text = response.text();
+    
+    // Log full response structure
+    console.log("Test response structure:", {
+      hasResponse: !!response,
+      hasTextMethod: typeof response.text === 'function',
+      candidates: response?.candidates?.length || 0,
+      finishReason: response?.candidates?.[0]?.finishReason
+    });
+    
+    let text = "";
+    try {
+      text = response.text();
+    } catch (e) {
+      // Try extracting from parts
+      const parts = response?.candidates?.[0]?.content?.parts || [];
+      text = parts.map(p => p.text).join(" ");
+    }
 
     res.json({
-      success: true,
+      success: !!text,
       model: GEMINI_MODEL,
-      response: text,
+      response: text || "(empty)",
+      responseStructure: {
+        hasResponse: !!response,
+        hasTextMethod: typeof response.text === 'function',
+        candidates: response?.candidates?.length || 0,
+        finishReason: response?.candidates?.[0]?.finishReason,
+        safetyRatings: response?.candidates?.[0]?.safetyRatings || []
+      },
       note: "Using @google/generative-ai SDK"
     });
   } catch (error) {
     res.status(500).json({ 
       error: error.message,
+      stack: error.stack,
       model: GEMINI_MODEL,
       note: "Make sure @google/generative-ai package is installed: npm install @google/generative-ai"
     });
