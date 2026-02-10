@@ -81,21 +81,22 @@ async function getEventsByCalendarId(calendarId) {
 
   const params = {
     calendarId,
-    singleEvents: true,          // expand recurring events
-    orderBy: "startTime",
-    maxResults: 2500,
-    timeMin,                     // only upcoming events
+    singleEvents: true, // Make sure that recurring events only return one instance
+    orderBy: "startTime", // Sort events by start time
+    maxResults: 2500, // Adjust if you expect more events
+    timeMin, // Only get upcoming events (if needed)
   };
 
   const { data } = await calendar.events.list(params);
   const events = data.items || [];
 
-  // Map to return only event name and event id
+  // Map to return only event name and event ID
   return events.map((ev) => ({
     id: ev.id,
     summary: ev.summary || "No Name",
   }));
 }
+
 
 /**
  * Bulk add emails to an event
