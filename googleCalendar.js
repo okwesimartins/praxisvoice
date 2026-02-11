@@ -90,12 +90,20 @@ async function getEventsByCalendarId(calendarId) {
   const { data } = await calendar.events.list(params);
   const events = data.items || [];
 
-  // Map to return only event name and event ID
-  return events.map((ev) => ({
+  // Filter to return only unique events based on summary
+  const uniqueEvents = Array.from(
+    new Set(events.map(event => event.summary))
+  ).map(summary => {
+    return events.find(event => event.summary === summary); // Returns first occurrence of each summary
+  });
+
+  // Map to return only event name and event ID for the filtered events
+  return uniqueEvents.map((ev) => ({
     id: ev.id,
     summary: ev.summary || "No Name",
   }));
 }
+
 
 
 /**
